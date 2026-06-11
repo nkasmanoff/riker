@@ -31,6 +31,11 @@
 	"linuxIconName": "code-oss",
 	"licenseFileName": "LICENSE.txt",
 	"reportIssueUrl": "https://github.com/microsoft/vscode/issues/new",
+	"extensionsGallery": {
+		"serviceUrl": "https://open-vsx.org/vscode/gallery",
+		"itemUrl": "https://open-vsx.org/vscode/item",
+		"resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}"
+	},
 	"nodejsRepository": "https://nodejs.org",
 	"urlProtocol": "code-oss",
 	"agentsTelemetryAppName": "agents",

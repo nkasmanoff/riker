@@ -50,13 +50,8 @@ export function hygiene(some: NodeJS.ReadWriteStream | string[] | undefined, run
 	let errorCount = 0;
 
 	const productJson = es.through(function (file: VinylFile) {
-		const product = JSON.parse(file.contents!.toString('utf8'));
-
-		if (product.extensionsGallery) {
-			console.error(`product.json: Contains 'extensionsGallery'`);
-			errorCount++;
-		}
-
+		// Fork note: upstream forbids `extensionsGallery` in product.json; this
+		// fork intentionally ships the Open VSX gallery, so the check is removed.
 		this.emit('data', file);
 	});
 

@@ -1,0 +1,85 @@
+{
+  "name": "opencode-agent",
+  "publisher": "vscode",
+  "displayName": "opencode Agent",
+  "description": "Native chat agent powered by the opencode CLI.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": false,
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "enabledApiProposals": [
+    "chatParticipantAdditions",
+    "chatParticipantPrivate",
+    "defaultChatParticipant",
+    "chatProvider"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "opencode Agent",
+      "properties": {
+        "opencode.editApproval": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "enumDescriptions": [
+            "Prompt before opencode applies each file edit (the pending diff is shown in chat first).",
+            "Apply file edits immediately; review them afterwards via the Keep/Undo pills."
+          ],
+          "default": "ask",
+          "description": "Whether opencode must ask for approval before editing files. Edits are blocked until you respond; \"Allow for Session\" stops prompting until the window is reloaded."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "chat.agent.thinking.collapsedTools": "off",
+      "chat.agent.thinkingStyle": "collapsedPreview",
+      "chat.checkpoints.showFileChanges": true
+    },
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode",
+        "displayName": "opencode"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "opencode.agent",
+        "name": "opencode",
+        "fullName": "opencode",
+        "description": "Ask opencode to build, edit, or explain code",
+        "isDefault": true,
+        "locations": [
+          "panel"
+        ],
+        "modes": [
+          "ask",
+          "agent"
+        ],
+        "commands": [
+          {
+            "name": "plan",
+            "description": "Run opencode in read-only Plan mode"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {}
+}

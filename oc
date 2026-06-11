@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Dev launcher for the opencode-powered Code-OSS build.
+# Usage:  oc [--foreground|-f] [path ...]    (defaults to current directory)
+#
+# Wraps scripts/code.sh with Copilot disabled so opencode is the only agent.
+# By default the app detaches and the terminal prompt returns immediately
+# (Electron output goes to $TMPDIR/oc-dev.log); pass --foreground to attach.
+
+set -e
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# code.sh runs build/lib/preLaunch.ts, which needs Node 24's native TypeScript
+# support. The shell's default Node may be older (e.g. 22), so switch to the
+# version pinned in .nvmrc before launching.
+if [ -s "$HOME/.nvm/nvm.sh" ]; then
+	# shellcheck disable=SC1091
+	. "$HOME/.nvm/nvm.sh"
+	nvm use --silent "$(cat "$ROOT/.nvmrc")" >/dev/null 2>&1 || nvm use --silent 24 >/dev/null 2>&1 || true
+fi
+
+# Skip the bundled GitHub Copilot Chat built-in extension entirely so it is
+# never scanned or activated. This is cleaner than --disable-extension: the
+# extension contributes several isDefault chat participants that would otherwise
+# compete with opencode for the default-agent slot and surface Copilot's
+# setup/sign-in UI. We leave product.json's `defaultChatAgent` untouched (it
+# only wires Copilot-specific setup/entitlement plumbing, not the runtime
+# default participant, which is driven by opencode.agent's isDefault:true).
+export VSCODE_SKIP_BUILTIN_EXTENSIONS="GitHub.copilot-chat,GitHub.copilot"
+
+# App-like launch by default: compile in the foreground (so build errors hit
+# your terminal), then detach Electron and give the prompt back. Use
+# --foreground / -f to stay attached (Electron logs in the terminal).
+FOREGROUND=0
+if [ "${1:-}" = "--foreground" ] || [ "${1:-}" = "-f" ]; then
+	FOREGROUND=1
+	shift
+fi
+
+# Default to the current directory if no path/flags were given.
+if [ "$#" -eq 0 ]; then
+	set -- "$PWD"
+fi
+
+if [ "$FOREGROUND" -eq 1 ]; then
+	exec "$ROOT/scripts/code.sh" "$@"
+fi
+
+# preLaunch fetches electron / compiles built-ins; keep it attached so any
+# build failure is visible here rather than buried in the log file.
+(cd "$ROOT" && node build/lib/preLaunch.ts)
+export VSCODE_SKIP_PRELAUNCH=1
+
+LOG="${TMPDIR:-/tmp}/oc-dev.log"
+nohup "$ROOT/scripts/code.sh" "$@" >"$LOG" 2>&1 &
+PID=$!
+disown
+echo "oc: launched (pid $PID, log: $LOG)"

@@ -28,6 +28,11 @@ export const all = Object.freeze<string[]>([
 	'!test/**/out/**',
 	'!**/node_modules/**',
 	'!**/*.js.map',
+
+	// Fork additions: not subject to upstream hygiene (plain-JS extension,
+	// no Microsoft copyright headers).
+	'!extensions/opencode-agent/**',
+	'!oc',
 ]);
 
 export const unicodeFilter = Object.freeze<string[]>([

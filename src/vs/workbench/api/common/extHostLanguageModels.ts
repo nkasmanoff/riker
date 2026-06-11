@@ -370,11 +370,23 @@ export class ExtHostLanguageModels implements ExtHostLanguageModelsShape {
 			await this.selectLanguageModels(extension, {});
 		}
 
+		let fallbackDefaultModelId: string | undefined;
 		for (const [modelIdentifier, modelData] of this._localModels) {
-			if (modelData.metadata.isDefaultForLocation[ChatAgentLocation.Chat] && modelData.metadata.vendor === COPILOT_VENDOR_ID) {
+			if (!modelData.metadata.isDefaultForLocation[ChatAgentLocation.Chat]) {
+				continue;
+			}
+			// Prefer a Copilot-provided default when present, but fall back to any
+			// vendor's default-for-Chat model so non-Copilot providers (e.g.
+			// opencode) can satisfy `request.model` when Copilot is absent.
+			if (modelData.metadata.vendor === COPILOT_VENDOR_ID) {
 				defaultModelId = modelIdentifier;
 				break;
+			} else if (!fallbackDefaultModelId) {
+				fallbackDefaultModelId = modelIdentifier;
 			}
+		}
+		if (!defaultModelId) {
+			defaultModelId = fallbackDefaultModelId;
 		}
 		if (!defaultModelId && !forceResolveModels) {
 			// Maybe the default wasn't cached so we will try again with resolving the models too
