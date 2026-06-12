@@ -1,78 +1,150 @@
-# Visual Studio Code - Open Source ("Code - OSS")
-[![Feature Requests](https://img.shields.io/github/issues/microsoft/vscode/feature-request.svg)](https://github.com/microsoft/vscode/issues?q=is%3Aopen+is%3Aissue+label%3Afeature-request+sort%3Areactions-%2B1-desc)
-[![Bugs](https://img.shields.io/github/issues/microsoft/vscode/bug.svg)](https://github.com/microsoft/vscode/issues?utf8=✓&q=is%3Aissue+is%3Aopen+label%3Abug)
-[![Gitter](https://img.shields.io/badge/chat-on%20gitter-yellow.svg)](https://gitter.im/Microsoft/vscode)
+# Riker
 
-## The Repository
-
-This repository ("`Code - OSS`") is where we (Microsoft) develop the [Visual Studio Code](https://code.visualstudio.com) product together with the community. Not only do we work on code and issues here, but we also publish our [roadmap](https://github.com/microsoft/vscode/wiki/Roadmap), [monthly iteration plans](https://github.com/microsoft/vscode/wiki/Iteration-Plans), and our [endgame plans](https://github.com/microsoft/vscode/wiki/Running-the-Endgame). This source code is available to everyone under the standard [MIT license](https://github.com/microsoft/vscode/blob/main/LICENSE.txt).
-
-## Visual Studio Code
+Riker is a fork of [Visual Studio Code – Open Source ("Code - OSS")](https://github.com/microsoft/vscode)
+that replaces GitHub Copilot with [**opencode**](https://opencode.ai) as the
+native, built-in chat agent. The agent is wired directly into VS Code's chat
+panel and Source Control view — no marketplace extension, no Copilot account.
 
 <p align="center">
-  <img alt="VS Code in action" src="https://github.com/user-attachments/assets/56af271c-949d-454c-a3ea-16188c063414">
+  <img alt="Riker in action" src="resources/riker/screenshot.png">
 </p>
 
-[Visual Studio Code](https://code.visualstudio.com) is a distribution of the `Code - OSS` repository with Microsoft-specific customizations released under a traditional [Microsoft product license](https://code.visualstudio.com/License/).
+> Built on Microsoft's MIT-licensed Code-OSS. See [License](#license) and
+> [Upstream](#upstream-code---oss) below.
 
-[Visual Studio Code](https://code.visualstudio.com) combines the simplicity of a code editor with what developers need for their core edit-build-debug cycle. It provides comprehensive code editing, navigation, and understanding support along with lightweight debugging, a rich extensibility model, and lightweight integration with existing tools.
+## What's different from Code-OSS
 
-Visual Studio Code is updated monthly with new features and bug fixes. You can download it for Windows, macOS, and Linux on [Visual Studio Code's website](https://code.visualstudio.com/Download). To get the latest releases every day, install the [Insiders build](https://code.visualstudio.com/insiders).
+- **opencode as the default chat agent.** A bundled built-in extension
+  (`extensions/opencode-agent`) registers a default chat participant
+  (`@opencode`) that drives the [opencode CLI](https://opencode.ai) and streams
+  responses — including reasoning tokens, tool calls, and file diffs — into the
+  native chat view. It talks to a long-lived `opencode serve` process over its
+  REST/SSE API for true token-by-token streaming.
+- **Rebranded as "Riker"** in `product.json` (application name, bundle id, URL
+  protocol, icons, etc.).
+- **Copilot removed.** The Copilot setup "sparkle" actions in the editor and
+  Source Control input are hidden, since Copilot is not part of this build.
+- **Editable system prompt.** Run `/system` in chat to open opencode's full
+  system prompt (the built-in agent prompt plus your extra instructions) as a
+  saveable markdown document. The base prompt is vendored under
+  `extensions/opencode-agent/prompts/builtin/`.
+- **Usage tracking.** A status-bar item shows session cost and context
+  consumption; `/usage` prints a detailed token/cost report for the session.
+- **AI commit messages.** A sparkle button in the Source Control input box
+  generates a commit message from your staged diff via OpenRouter.
+- **Interactive questions.** opencode's `question`/`ask` tool is surfaced as a
+  native quick-pick so the agent can ask you to choose between options mid-turn.
 
-## Contributing
+### Chat commands
 
-There are many ways in which you can participate in this project, for example:
+| Command    | Description                                                            |
+| ---------- | ---------------------------------------------------------------------- |
+| `/plan`    | Run opencode in read-only Plan mode.                                   |
+| `/system`  | Edit extra system instructions (`/system <text>` sets, `clear` resets).|
+| `/usage`   | Show context, token, and cost usage for the session.                   |
 
-* [Submit bugs and feature requests](https://github.com/microsoft/vscode/issues), and help us verify as they are checked in
-* Review [source code changes](https://github.com/microsoft/vscode/pulls)
-* Review the [documentation](https://github.com/microsoft/vscode-docs) and make pull requests for anything from typos to new content.
+## Prerequisites
 
-If you are interested in fixing issues and contributing directly to the code base,
-please see the document [How to Contribute](https://github.com/microsoft/vscode/wiki/How-to-Contribute), which covers the following:
+1. **opencode CLI** — the agent shells out to it. Install and authenticate:
 
-* [How to build and run from source](https://github.com/microsoft/vscode/wiki/How-to-Contribute)
-* [The development workflow, including debugging and running tests](https://github.com/microsoft/vscode/wiki/How-to-Contribute#debugging)
-* [Coding guidelines](https://github.com/microsoft/vscode/wiki/Coding-Guidelines)
-* [Submitting pull requests](https://github.com/microsoft/vscode/wiki/How-to-Contribute#pull-requests)
-* [Finding an issue to work on](https://github.com/microsoft/vscode/wiki/How-to-Contribute#where-to-contribute)
-* [Contributing to translations](https://aka.ms/vscodeloc)
+   ```bash
+   # install (see https://opencode.ai for other methods)
+   curl -fsSL https://opencode.ai/install | bash
 
-## Feedback
+   # log in to a provider (Anthropic, OpenAI, OpenRouter, etc.)
+   opencode auth login
+   ```
 
-* Ask a question on [Stack Overflow](https://stackoverflow.com/questions/tagged/vscode)
-* [Request a new feature](CONTRIBUTING.md)
-* Upvote [popular feature requests](https://github.com/microsoft/vscode/issues?q=is%3Aopen+is%3Aissue+label%3Afeature-request+sort%3Areactions-%2B1-desc)
-* [File an issue](https://github.com/microsoft/vscode/issues)
-* Connect with the extension author community on [GitHub Discussions](https://github.com/microsoft/vscode-discussions/discussions) or [Slack](https://aka.ms/vscode-dev-community)
-* Follow [@code](https://x.com/code) and let us know what you think!
+   Riker auto-detects the binary at `~/.opencode/bin/opencode`, Homebrew, or
+   `/usr/local/bin`. To point at a custom location, set `OPENCODE_CLI` to its
+   absolute path.
 
-See our [wiki](https://github.com/microsoft/vscode/wiki/Feedback-Channels) for a description of each of these channels and information on some other available community-driven channels.
+2. **(Optional) `OPENROUTER_API_KEY`** — only needed for the **Generate Commit
+   Message** sparkle in Source Control. Export it in the shell you launch Riker
+   from (it's the same variable opencode's OpenRouter provider uses):
 
-## Related Projects
+   ```bash
+   export OPENROUTER_API_KEY="sk-or-..."
+   ```
 
-Many of the core components and extensions to VS Code live in their own repositories on GitHub. For example, the [node debug adapter](https://github.com/microsoft/vscode-node-debug) and the [mono debug adapter](https://github.com/microsoft/vscode-mono-debug) repositories are separate from each other. For a complete list, please visit the [Related Projects](https://github.com/microsoft/vscode/wiki/Related-Projects) page on our [wiki](https://github.com/microsoft/vscode/wiki).
+3. **Build toolchain** for Code-OSS: Node.js (see `.nvmrc`), Python, and a
+   C/C++ compiler. See the upstream
+   [How to Contribute](https://github.com/microsoft/vscode/wiki/How-to-Contribute#build-and-run)
+   guide for platform-specific build dependencies.
 
-## Bundled Extensions
+## Build and run from source
 
-VS Code includes a set of built-in extensions located in the [extensions](extensions) folder, including grammars and snippets for many languages. Extensions that provide rich language support (inline suggestions, Go to Definition) for a language have the suffix `language-features`. For example, the `json` extension provides coloring for `JSON` and the `json-language-features` extension provides rich language support for `JSON`.
+```bash
+git clone https://github.com/nkasmanoff/riker.git
+cd riker
 
-## Development Container
+# Use the Node version pinned in .nvmrc
+nvm use            # or install that version manually
 
-This repository includes a Visual Studio Code Dev Containers / GitHub Codespaces development container.
+npm install        # installs dependencies (runs against electron headers)
+npm run watch      # incremental compile; leave running in one terminal
+```
 
-* For [Dev Containers](https://aka.ms/vscode-remote/download/containers), use the **Dev Containers: Clone Repository in Container Volume...** command which creates a Docker volume for better disk I/O on macOS and Windows.
-  * If you already have VS Code and Docker installed, you can also click [here](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/microsoft/vscode) to get started. This will cause VS Code to automatically install the Dev Containers extension if needed, clone the source code into a container volume, and spin up a dev container for use.
+Then launch the dev build in a second terminal:
 
-* For Codespaces, install the [GitHub Codespaces](https://marketplace.visualstudio.com/items?itemName=GitHub.codespaces) extension in VS Code, and use the **Codespaces: Create New Codespace** command.
+```bash
+./scripts/code.sh          # macOS / Linux
+# .\scripts\code.bat       # Windows
+```
 
-Docker / the Codespace should have at least **4 cores and 6 GB of RAM (8 GB recommended)** to run a full build. See the [development container README](.devcontainer/README.md) for more information.
+This opens the Riker desktop app with the opencode agent already active. Open
+the Chat view and start a conversation with `@opencode` (it's the default
+participant, so you can also just type).
 
-## Code of Conduct
+> First run: make sure you've run `opencode auth login` beforehand, otherwise
+> the agent will report an authentication error from the opencode server.
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/). For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+### Settings
+
+Configure under **Settings → Extensions → opencode Agent**, or in
+`settings.json`:
+
+| Setting                       | Default           | Purpose                                                                 |
+| ----------------------------- | ----------------- | ----------------------------------------------------------------------- |
+| `opencode.editApproval`       | `ask`             | `ask` to approve each file edit before it's applied, or `auto` to apply and review after. |
+| `opencode.systemPrompt`       | `""`              | Extra instructions appended to opencode's agent prompt every turn.       |
+| `opencode.commitMessageModel` | `openrouter/auto` | OpenRouter model slug used by **Generate Commit Message**.               |
+
+## Working with upstream
+
+This fork keeps Microsoft's repository as the `upstream` remote so you can pull
+in new VS Code releases:
+
+```bash
+git remote -v
+# origin    https://github.com/nkasmanoff/riker.git   (your fork)
+# upstream  https://github.com/microsoft/vscode.git    (Code-OSS)
+
+git fetch upstream
+git merge upstream/main      # resolve conflicts in product.json etc. as needed
+```
+
+The opencode integration lives entirely in `extensions/opencode-agent/`, plus
+small edits to `product.json` and the two SCM contribution files that hide the
+Copilot sparkles — keeping the conflict surface with upstream small.
+
+### Running the extension tests
+
+```bash
+node extensions/opencode-agent/test/unit.js
+```
+
+## Upstream (Code - OSS)
+
+Riker is built from [microsoft/vscode](https://github.com/microsoft/vscode),
+the open-source core of Visual Studio Code. Refer to upstream for the editor
+architecture, bundled extensions, dev container, and contribution guidelines.
+This fork is **not affiliated with or endorsed by Microsoft.**
 
 ## License
 
-Copyright (c) Microsoft Corporation. All rights reserved.
+Riker is distributed under the [MIT](LICENSE.txt) license, the same license as
+Code-OSS.
 
-Licensed under the [MIT](LICENSE.txt) license.
+Copyright (c) Microsoft Corporation. All rights reserved. (Original Code-OSS
+code and third-party notices retain their copyright.)

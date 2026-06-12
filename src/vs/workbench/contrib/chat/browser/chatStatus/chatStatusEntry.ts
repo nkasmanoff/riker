@@ -22,9 +22,8 @@ import { $ as h, disposableWindowInterval } from '../../../../../base/browser/do
 import { isNewUser } from './chatStatus.js';
 import product from '../../../../../platform/product/common/product.js';
 import { isCompletionsEnabled } from '../../../../../editor/common/services/completionsEnablement.js';
-import { CHAT_SETUP_ACTION_ID } from '../actions/chatActions.js';
+import { CHAT_OPEN_ACTION_ID } from '../actions/chatActions.js';
 import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
-import { isWeb } from '../../../../../base/common/platform.js';
 import { InEditorZenModeContext } from '../../../../common/contextkeys.js';
 import { ChatConfiguration } from '../../common/constants.js';
 
@@ -235,45 +234,19 @@ export class ChatStatusBarEntry extends Disposable implements IWorkbenchContribu
 	}
 
 	private getSetupEntryProps(): IStatusbarEntry {
-		const showSignInLabel = !this.isSignInTitleBarAffordanceVisible();
-		const signInLabel = localize('signIn', "Sign In");
+		// opencode build: Copilot's sign-in/setup flow is not used (Copilot is
+		// skipped entirely). Rebrand this entry for the opencode agent and have
+		// it open the chat view instead of triggering the (defunct) Copilot setup.
+		const openChatLabel = localize('openOpencode', "opencode");
 		return {
-			name: localize('chatStatus', "Copilot Status"),
-			text: showSignInLabel ? `$(copilot) ${signInLabel}` : '$(copilot)',
-			ariaLabel: showSignInLabel ? signInLabel : localize('chatStatusAria', "Copilot status"),
-			command: CHAT_SETUP_ACTION_ID,
+			name: localize('opencodeStatus', "opencode"),
+			text: `$(hubot) ${openChatLabel}`,
+			ariaLabel: localize('openOpencodeAria', "Open opencode chat"),
+			command: CHAT_OPEN_ACTION_ID,
 			showInAllWindows: true,
 			kind: undefined,
 			content: this.entryAnchor,
 		};
-	}
-
-	private isSignInTitleBarAffordanceVisible(): boolean {
-		if (isWeb) {
-			return false;
-		}
-
-		// Title bar sign-in button only shows when user is signed out
-		if (this.chatEntitlementService.entitlement !== ChatEntitlement.Unknown) {
-			return false;
-		}
-
-		if (this.chatEntitlementService.sentiment.hidden || this.chatEntitlementService.sentiment.disabledInWorkspace) {
-			return false;
-		}
-
-		const hasTitleBarUpdate = Boolean(this.contextKeyService.getContextKeyValue('updateTitleBar'));
-		if (hasTitleBarUpdate) {
-			return false;
-		}
-
-		const inZenMode = Boolean(this.contextKeyService.getContextKeyValue(InEditorZenModeContext.key));
-		if (inZenMode) {
-			return false;
-		}
-
-		const signInTitleBarEnabled = this.configurationService.getValue<boolean>(ChatConfiguration.TitleBarSignInEnabled) !== false;
-		return signInTitleBarEnabled;
 	}
 
 	override dispose(): void {

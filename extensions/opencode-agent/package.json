@@ -1,0 +1,126 @@
+{
+  "name": "opencode-agent",
+  "publisher": "vscode",
+  "displayName": "opencode Agent",
+  "description": "Native chat agent powered by the opencode CLI.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": false,
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "enabledApiProposals": [
+    "chatParticipantAdditions",
+    "chatParticipantPrivate",
+    "defaultChatParticipant",
+    "chatProvider",
+    "contribSourceControlInputBoxMenu"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "opencode.editSystemPrompt",
+        "title": "Edit System Prompt",
+        "category": "opencode"
+      },
+      {
+        "command": "opencode.generateCommitMessage",
+        "title": "Generate Commit Message",
+        "category": "opencode",
+        "icon": "$(sparkle)"
+      }
+    ],
+    "menus": {
+      "scm/inputBox": [
+        {
+          "command": "opencode.generateCommitMessage",
+          "when": "scmProvider == git"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "opencode Agent",
+      "properties": {
+        "opencode.editApproval": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "enumDescriptions": [
+            "Prompt before opencode applies each file edit (the pending diff is shown in chat first).",
+            "Apply file edits immediately; review them afterwards via the Keep/Undo pills."
+          ],
+          "default": "ask",
+          "description": "Whether opencode must ask for approval before editing files. Edits are blocked until you respond; \"Allow for Session\" stops prompting until the window is reloaded."
+        },
+        "opencode.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "markdownDescription": "Extra system instructions sent with every opencode turn. Appended **after** opencode's built-in agent prompt (it augments, never replaces it). Also editable from chat via `/system`."
+        },
+        "opencode.commitMessageModel": {
+          "type": "string",
+          "default": "openrouter/auto",
+          "markdownDescription": "OpenRouter model slug used by **Generate Commit Message** in the Source Control input (e.g. `anthropic/claude-haiku-4.5` or another cheap, fast model). Authenticates with the `OPENROUTER_API_KEY` environment variable — the same one opencode's OpenRouter provider uses."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "chat.agent.thinking.collapsedTools": "off",
+      "chat.agent.thinkingStyle": "collapsedPreview",
+      "chat.checkpoints.showFileChanges": true
+    },
+    "languageModelChatProviders": [
+      {
+        "vendor": "opencode",
+        "displayName": "opencode"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "opencode.agent",
+        "name": "opencode",
+        "fullName": "opencode",
+        "description": "Ask opencode to build, edit, or explain code",
+        "isDefault": true,
+        "locations": [
+          "panel"
+        ],
+        "modes": [
+          "ask",
+          "agent"
+        ],
+        "commands": [
+          {
+            "name": "plan",
+            "description": "Run opencode in read-only Plan mode"
+          },
+          {
+            "name": "system",
+            "description": "Edit extra system instructions in a markdown editor (/system <text> sets inline, /system clear)"
+          },
+          {
+            "name": "usage",
+            "description": "Show context, token, and cost usage for this session"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {}
+}

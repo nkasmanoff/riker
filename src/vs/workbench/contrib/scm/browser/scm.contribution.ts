@@ -678,6 +678,10 @@ registerAction2(class extends Action2 {
 			menu: {
 				id: MenuId.EditorContent,
 				when: ContextKeyExpr.and(
+					// opencode fork: never show the Copilot setup sparkle — Copilot is
+					// removed from this build, so the setup flow it triggers can only
+					// fail (same pattern as the SCM input box sparkle in scmInput.ts).
+					ContextKeyExpr.false(),
 					ChatContextKeys.Setup.hidden.negate(),
 					ChatContextKeys.Setup.disabledInWorkspace.negate(),
 					ChatContextKeys.Setup.completed.negate(),

@@ -239,20 +239,23 @@ export const TIP_CATALOG: readonly ITipDefinition[] = [
 		id: 'tip.planMode',
 		tier: ChatTipTier.Foundational,
 		priority: 20,
-		buildMessage(ctx) {
-			const kb = formatKeybinding(ctx, 'workbench.action.chat.openPlan');
+		buildMessage() {
+			// opencode build: there is no dedicated "Plan" chat mode (that was
+			// contributed by the now-disabled Copilot extension, so
+			// `workbench.action.chat.openPlan` is unregistered and the link was
+			// dead). opencode exposes plan as the `/plan` slash command, so open
+			// the chat view prefilled with `/plan ` and let the user add their task.
+			const openPlanArgs = encodeURIComponent(JSON.stringify([{ query: '/plan ', isPartialQuery: true }]));
 			return new MarkdownString(
 				localize(
 					'tip.planMode',
-					"Try the [{0}](command:workbench.action.chat.openPlan \"Start Plan Mode\"){1} to research and plan before implementing changes.",
-					'Plan agent',
-					kb
+					"Try [{0}](command:workbench.action.chat.open?{1} \"Start Plan Mode\") to research and plan before implementing changes.",
+					'Plan mode',
+					openPlanArgs
 				)
 			);
 		},
-		when: ChatContextKeys.chatModeName.notEqualsTo('Plan'),
 		excludeWhenCommandsExecuted: ['workbench.action.chat.openPlan'],
-		excludeWhenModesUsed: ['Plan'],
 	},
 	{
 		id: 'tip.attachFiles',
