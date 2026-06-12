@@ -85,9 +85,67 @@ and what's left to do. Pick up from here.
   intervening edit invalidates the snapshot. Caveat: the line-numbered read
   format can't represent a missing trailing newline — we assume one.
   Covered by `test/unit.js`.
-- **Status bar cost**: a status bar item (right side) shows cumulative
-  session spend; tooltip has last-turn + session totals. Hidden until the
-  first turn that reports a cost. (`src/extension.js`)
+- **Interactive questions** (`question.asked`): opencode's question tool used
+  to stall/no-op — the event was never handled, so questions rendered nothing
+  clickable in chat. Now the driver delegates to an `askQuestion` callback
+  (same pattern as `approveEdit`) while the tool is blocked server-side, and
+  the extension renders the full question + every option (with descriptions)
+  expanded in the chat transcript, then collects the answer via QuickPick:
+  clickable options, multi-select when `multiple`, free text via "Custom
+  answer…" (opencode's `custom` defaults to true; InputBox), per-question
+  progress for multi-question requests. Valid answers POST
+  `/question/{id}/reply` (`{ answers: string[][] }` — selected labels per
+  question); dismissal/errors POST `/question/{id}/reject` so the turn never
+  hangs (the tool errors with "user dismissed" and the model continues).
+  Cancelling the turn rejects pending questions before `session/abort`, and a
+  late answer after interrupt is dropped (no double-reply). Driver-side flow
+  covered in `test/unit.js` via a mocked server module.
+  (`src/opencode.js`, `src/extension.js`)
+- **Status bar cost + context**: a status bar item (right side) shows
+  cumulative session spend and current context usage (`$0.12 · 17%`);
+  tooltip has last-turn cost, session total, approximate context tokens vs
+  the model's limit, and last-turn token breakdown. Hidden until the first
+  turn reports cost or tokens. (`src/extension.js`)
+- **`/system` — the FULL system prompt, viewable and editable**: bare
+  `/system` opens `opencode:/system-prompt.md` (writable FileSystemProvider;
+  also command palette "opencode: Edit System Prompt") showing both editable
+  layers of the prompt with marker-delimited sections:
+  - **BASE agent prompt** — the build agent's override if set (from
+    `GET /agent`), else opencode's built-in provider prompt for the current
+    model. The built-ins ship inside the binary and aren't exposed over the
+    API, so exact copies are vendored in `prompts/builtin/` (pinned to
+    v1.17.4; verified byte-identical to v1.15.10) with the selection logic
+    ported from `SystemPrompt.provider()`
+    (`src/systemPrompt.js` `builtinPromptName`, keyed on the catalog's
+    `model.api.id`). Editing this section REPLACES the built-in prompt:
+    saves write `agent.build.prompt` into the workspace's `opencode.json`
+    (merge-preserving; refuses to clobber JSONC) and `POST /instance/dispose`
+    so the running server reloads config (verified live). Restoring the
+    built-in text exactly removes the override (and deletes `opencode.json`
+    if it's now empty). **Gotcha:** `PATCH /config` is a dead end at
+    v1.15.10 — it persists to `<dir>/config.json`, which the config loader
+    never reads back (only `opencode.json`/`opencode.jsonc`; verified live).
+  - **EXTRA instructions** — the `opencode.systemPrompt` setting (workspace
+    target when a folder is open; also in Settings UI). Sent per turn as the
+    message POST's `system` field, which opencode appends after the base
+    (`LLMRequestPrep.prepare` joins `[agent.prompt ?? builtin, ...system,
+    user.system]`). `/system <text>` sets inline, `/system clear` clears.
+  - Not editable (regenerated each turn, noted in the doc header): the
+    environment block, AGENTS.md instruction files, skills listing.
+  - Saves only touch a section that actually changed vs what was rendered;
+    mangled markers fail the save without writing anything. Doc build/parse
+    + prompt selection covered in `test/unit.js`.
+  (`src/systemPrompt.js`, `src/opencode.js` `configure/send`,
+  `src/extension.js`, `prompts/builtin/`, `package.json`)
+- **`/usage` — context/token/cost report in chat**: context tokens consumed
+  (≈ last assistant message's input + cache read/write + output + reasoning)
+  vs the model's context limit, last-turn token breakdown, last-turn +
+  window cost, and the model's per-1M pricing. Limits/pricing come from
+  `GET /config/providers` (cached per window; keys `providerID/modelID`
+  match the CLI model ids — verified live). Token counts are captured in
+  the driver from assistant `message.updated` events and emitted on
+  `turn-complete`. Both `/system` and `/usage` are answered locally — no
+  opencode turn is spent. (`src/opencode.js`, `src/extension.js`)
 - **Error surfacing**: opencode errors and handler failures render as proper
   chat warning parts (`stream.warning`) instead of bold markdown.
 - **Thinking/reasoning**: reasoning deltas stream through
@@ -122,11 +180,46 @@ and what's left to do. Pick up from here.
   Signature verification is a non-issue here: the check is skipped when
   `!environmentService.isBuilt` (dev builds), and unsigned installs are
   otherwise governed by `shouldRequireRepositorySignatureFor`.
+- **Commit message generation (SCM sparkle) via OpenRouter**: Copilot's
+  "Generate Commit Message" died with Copilot removed; replaced with
+  `opencode.generateCommitMessage`, contributed to the `scm/inputBox` menu
+  (proposed API `contribSourceControlInputBoxMenu`; the toolbar invokes it
+  as `(rootUri, context, token)` per `SCMInputWidgetActionRunner`). Reads
+  the staged diff (falls back to working tree + untracked list) and the
+  last 8 commit subjects for style via the `vscode.git` API, then calls
+  OpenRouter chat completions directly with the `OPENROUTER_API_KEY` env
+  var (same one opencode's provider uses) and writes the result into
+  `repo.inputBox.value`. Model: `opencode.commitMessageModel` setting
+  (default `openrouter/auto`); 24k-char diff cap, 30s timeout, toolbar
+  cancel honored. Verified live end-to-end. Prompt build/cleanup helpers
+  unit-tested (`vscode` import is guarded so test/unit.js can load the
+  module outside the host). (`src/commitMessage.js`, `package.json`)
+  **Core patch required**: the built-in `scm.input.triggerSetup` sparkle
+  (same title, same menu) runs the Copilot *setup* flow and then
+  `product.defaultChatAgent.generateCommitMessageCommand` — both dead in
+  this build, so clicking it always failed; with two actions in the menu it
+  could also shadow ours as the primary. Disabled via `ContextKeyExpr.false()`
+  in its menu `when` (`src/vs/workbench/contrib/scm/browser/scmInput.ts`,
+  needs `npm run compile`).
 - **Copilot removed from build**: launchers set
   `VSCODE_SKIP_BUILTIN_EXTENSIONS="GitHub.copilot-chat,GitHub.copilot"` so the
   bundled Copilot extension is never scanned/activated (it otherwise registers
   competing `isDefault` participants). `defaultChatAgent` in `product.json` left
   untouched on purpose (see Decisions below). (`../../oc`)
+
+- **Product renamed to "Riker"** (Star Trek: the Number One who executes,
+  while the captain — you — keeps the conn). `product.json`: `nameShort`/
+  `nameLong` → `Riker`, `applicationName`/`urlProtocol` → `riker`,
+  `darwinBundleIdentifier` → `com.riker.editor`, win32/linux names updated.
+  `dataFolderName` (`.vscode-oss`) deliberately left unchanged so existing
+  settings/extensions/state survive. New logo (white "R" with warp streak on
+  a space squircle) installed at `resources/darwin/code.icns` (mac dock),
+  `resources/linux/code.png`, `resources/server/code-{192,512}.png` +
+  `manifest.json`. Dev bundle rebuilt via `npm run electron` →
+  `.build/electron/Riker.app`; `scripts/code.sh` picks the name up from
+  `product.json` automatically. Note: macOS keychain "safe storage" is keyed
+  by app name, so previously stored secrets (e.g. GitHub auth) may require
+  one re-login under the new name.
 
 ### Core engine patch
 - `src/vs/workbench/api/common/extHostLanguageModels.ts` —
@@ -174,6 +267,32 @@ prompt. Possible refinements:
 - **Rate-limit info**: not parsed from the opencode stream yet; the status bar
   currently shows cost only.
 
+### 2b. Copilot-surface audit (2026-06-12) — remaining candidates
+Full sweep of `product.defaultChatAgent` consumers + `Setup.completed.negate()`
+nudges. Fixed: SCM input sparkle, merge-conflict "Resolve Conflicts with AI"
+(both disabled via `ContextKeyExpr.false()`, see core patches). Remaining,
+in rough priority order:
+- **Inline editor chat (Cmd+I)** — no `EditorInline` default agent, so inline
+  chat is dark. Participant `locations` accepts `"editor"`
+  (`ChatAgentLocation.fromRaw`); adding it + `isDefault` would light it up
+  with opencode. Caveats: inline chat sessions set `canUseTools: false` and
+  expect fast, localized responses — opencode's full agent loop edits files
+  via its own tools, so UX needs thought (maybe a dedicated low-tool agent).
+- **Terminal chat (Cmd+I in terminal)** — same story via `"terminal"`
+  location; `terminalChatEnabler.ts` only needs a default Terminal agent to
+  enable the UI. opencode could suggest/explain commands.
+- **Ghost-text inline completions** — Copilot's completions are simply gone
+  (provider-driven; engine's `completionsEnablement.ts` reads a Copilot
+  setting name from `defaultChatAgent`, no provider registered). Could
+  register an `InlineCompletionItemProvider` in opencode-agent backed by the
+  local llama.cpp server (`north-mini-code` @ 127.0.0.1:8765, FIM-capable,
+  zero cost/latency-friendly) or OpenRouter. Largest effort, biggest win.
+- **Dormant/cosmetic, no action**: chat setup welcome views + terms
+  disclaimers (chatQuick/chatWidget/agentSessionsWelcome), Getting Started
+  walkthrough Copilot steps, `defaultAccount.ts` entitlement sync, extension
+  gallery Copilot nudges, settings/search AI providers (hidden without a
+  provider extension).
+
 ### 3. Productionizing the build (optional, more invasive)
 - Decide whether to fully remove `extensions/copilot` from the source/compile
   graph (`compile-copilot`/`watch-copilot`) vs. the current scan-skip approach.
@@ -183,6 +302,17 @@ prompt. Possible refinements:
 
 ## Key Decisions / Gotchas
 
+- **opencode 1.15.x is unusable with a DB migrated to the `session_message.seq`
+  schema** (upstream bug, fixed in 1.16.2+): every `POST /session/{id}/message`
+  500s with `SQLiteError: NOT NULL constraint failed: session_message.seq` —
+  the 1.15.x `appendMessage` on the `session.next.agent.switched` path (fires
+  on every new session's first message) inserts without `seq`. The shared DB
+  (`~/.local/share/opencode/opencode.db`) gets the new schema as soon as ANY
+  newer opencode touches it (e.g. the OpenCode desktop app), silently breaking
+  older CLIs. Symptom in chat: `UnknownError ... Check server logs`; logs at
+  `~/.local/share/opencode/log/`. Fix: `opencode upgrade` (≥1.16.2) and kill
+  any stale `opencode serve` so the extension respawns the new binary (it
+  auto-respawns: `server.js` clears its cache on child exit).
 - **Do NOT repoint `product.json` `defaultChatAgent` to opencode.** The runtime
   default agent is determined solely by a participant with `isDefault: true`
   (`chatAgents.ts:442-448`). `defaultChatAgent.extensionId/chatExtensionId` only
@@ -211,18 +341,30 @@ prompt. Possible refinements:
   git checkout opencode && git merge main   # resolve conflicts in our 4 core files
   npm i && npm run compile                  # engine changed → recompile
   ```
-  Our core-patch surface is intentionally tiny (4 files: `product.json`,
-  `extHostLanguageModels.ts`, `chatStatusEntry.ts`, `chatTipCatalog.ts`) +
+  Our core-patch surface is intentionally tiny (6 files: `product.json`,
+  `extHostLanguageModels.ts`, `chatStatusEntry.ts`, `chatTipCatalog.ts`,
+  `scmInput.ts` — Copilot setup sparkle disabled in the SCM input menu,
+  `scm.contribution.ts` — same for "Resolve Conflicts with AI") +
   the self-contained `extensions/opencode-agent/` + `oc`, so merges should
   rarely conflict. After any merge, sanity-check the proposed APIs we use
   (`externalEdit`, `thinkingProgress`, `chatProvider`) still exist.
 - **opencode**: installed at `~/.opencode/bin/opencode`; update with
-  `opencode upgrade`. Our integration is tested against **v1.15.10** and
+  `opencode upgrade`. Our integration is tested against **v1.15.10–v1.17.4**
+  (1.15.x had a fatal upstream bug — see Gotchas) and
   depends on server API surfaces that can drift across versions: the
   `/event` SSE shapes (`message.part.delta`, `message.part.updated`,
   `session.idle`), `POST /session` `permission` ruleset,
-  `permission.asked` `metadata.{filepath,diff}`, and
-  `/session/{id}/permissions/{permissionID}` replies. After upgrading run
+  `permission.asked` `metadata.{filepath,diff}`,
+  `/session/{id}/permissions/{permissionID}` replies,
+  `question.asked`/`/question/{id}/reply`, `GET /agent`,
+  `GET /config/providers`, and `POST /instance/dispose`. The vendored
+  built-in prompts (`prompts/builtin/`, shown in the `/system` editor) and
+  the ported selection logic (`builtinPromptName`) are pinned to v1.17.4 —
+  re-vendor from `packages/opencode/src/session/prompt/*.txt` and re-check
+  `SystemPrompt.provider()` in `src/session/system.ts` after upgrading.
+  Also re-test whether `PATCH /config` is still broken (writes unread
+  `config.json`) — if fixed upstream, `_saveBaseOverride` could use it
+  instead of writing `opencode.json` directly. After upgrading run
   `node test/unit.js && node test/smoke.js` (live smoke hits a real server)
   before trusting a new version.
 

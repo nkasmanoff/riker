@@ -25,6 +25,15 @@
 // { filepath, patterns, diff, callID } while the tool is still blocked and
 // returns 'once' to apply or 'reject' to deny. Without a callback the gate
 // auto-approves with "once".
+//
+// Questions: opencode's `ask`/`question` tool emits `question.asked`, a
+// QuestionRequest carrying one or more questions (each with a short header,
+// the full question text, and selectable options) and blocks until the
+// client replies. We delegate to an optional `askQuestion` callback (the UI
+// lives in the extension): it receives { id, questions, tool } and returns an
+// array of answers (one per question, each an array of selected labels) to
+// reply, or null/undefined to reject. Without a callback the question is
+// rejected so the turn never hangs.
 
 const { parseReadToolOutput } = require('./fileEdits');
 const { getServerUrl, api, subscribeEvents } = require('./server');
@@ -45,6 +54,7 @@ function normalizeToolName(name) {
 		glob: 'Glob',
 		list: 'List',
 		webfetch: 'WebFetch',
+		question: 'Question',
 		task: 'Task',
 		todowrite: 'TodoWrite',
 		todoread: 'TodoRead'
@@ -64,11 +74,15 @@ function splitModelId(id) {
 class OpencodeDriver {
 	/**
 	 * @param {(event: any) => void} emit normalized event sink
-	 * @param {{ approveEdit?: (req: { filepath?: string, patterns: string[], diff?: string, callID?: string }) => Promise<'once' | 'reject'> }} [opts]
+	 * @param {{
+	 *   approveEdit?: (req: { filepath?: string, patterns: string[], diff?: string, callID?: string }) => Promise<'once' | 'reject'>,
+	 *   askQuestion?: (req: { id: string, questions: any[], tool?: any }) => Promise<string[][] | null | undefined>
+	 * }} [opts]
 	 */
 	constructor(emit, opts = {}) {
 		this.emit = emit;
 		this.approveEdit = typeof opts.approveEdit === 'function' ? opts.approveEdit : null;
+		this.askQuestion = typeof opts.askQuestion === 'function' ? opts.askQuestion : null;
 		this.sessionId = null;
 		this.emittedSession = false;
 
@@ -81,12 +95,15 @@ class OpencodeDriver {
 		this.seenToolResult = new Set();
 		this.seenCostParts = new Set();
 		this.gateDiffs = new Map(); // callID -> { filepath, diff } from permission.asked
+		this.pendingQuestionIds = new Set(); // question.asked awaiting our reply
 		this.turnCost = 0;
+		this.lastTokens = null; // latest assistant message tokens (context usage)
 		this.interrupted = false;
 
 		this.projectDir = process.cwd();
 		this.model = '';
 		this.mode = 'build';
+		this.systemPrompt = '';
 	}
 
 	configure(opts) {
@@ -101,6 +118,9 @@ class OpencodeDriver {
 		}
 		if (opts.mode) {
 			this.mode = opts.mode;
+		}
+		if (typeof opts.systemPrompt === 'string') {
+			this.systemPrompt = opts.systemPrompt;
 		}
 		return this.sessionId;
 	}
@@ -157,6 +177,13 @@ class OpencodeDriver {
 			if (this.mode && this.mode !== 'build') {
 				body.agent = this.mode;
 			}
+			// Extra system instructions, APPENDED after the agent's built-in
+			// prompt + environment/instruction blocks (LLMRequestPrep.prepare in
+			// opencode joins [agent.prompt, ...system, user.system]) — it
+			// augments, never replaces, the agent prompt.
+			if (this.systemPrompt) {
+				body.system = this.systemPrompt;
+			}
 
 			// The POST resolves when the reply finishes generating, but trailing
 			// events (final part updates, session.idle) can arrive just after.
@@ -176,13 +203,13 @@ class OpencodeDriver {
 			]);
 			await post.catch(() => { /* error already surfaced via session.error/abort */ });
 
-			this.emit({ kind: 'turn-complete', costUsd: this.turnCost });
+			this.emit({ kind: 'turn-complete', costUsd: this.turnCost, tokens: this.lastTokens });
 			return { code: this.interrupted ? null : 0 };
 		} catch (err) {
 			if (!this.interrupted) {
 				this.emit({ kind: 'error', message: String(err && err.message || err) });
 			}
-			this.emit({ kind: 'turn-complete', costUsd: this.turnCost });
+			this.emit({ kind: 'turn-complete', costUsd: this.turnCost, tokens: this.lastTokens });
 			return { code: this.interrupted ? null : 1 };
 		} finally {
 			ac.abort();
@@ -195,9 +222,17 @@ class OpencodeDriver {
 	interrupt() {
 		this.interrupted = true;
 		const sessionId = this.sessionId;
+		// Unblock any question tool still waiting on us before aborting the
+		// session, so the server doesn't keep the request pending forever.
+		const pendingQuestions = [...this.pendingQuestionIds];
+		this.pendingQuestionIds.clear();
 		if (sessionId) {
 			getServerUrl()
-				.then((baseUrl) => api(baseUrl, 'POST', `/session/${sessionId}/abort`, { directory: this.projectDir }))
+				.then((baseUrl) => Promise.allSettled([
+					...pendingQuestions.map((id) =>
+						api(baseUrl, 'POST', `/question/${id}/reject`, { directory: this.projectDir })),
+					api(baseUrl, 'POST', `/session/${sessionId}/abort`, { directory: this.projectDir })
+				]))
 				.catch(() => { /* best effort */ });
 		}
 		this.abortController?.abort();
@@ -223,6 +258,7 @@ class OpencodeDriver {
 		this.seenToolResult.clear();
 		this.seenCostParts.clear();
 		this.gateDiffs.clear();
+		this.pendingQuestionIds.clear();
 		this.turnCost = 0;
 		this.interrupted = false;
 	}
@@ -248,6 +284,11 @@ class OpencodeDriver {
 				const info = props.info ?? {};
 				if (info.sessionID === this.sessionId && info.role === 'user' && info.id) {
 					this.userMessageIds.add(info.id);
+				}
+				// The assistant message accumulates token counts as steps finish;
+				// the latest update reflects current context consumption.
+				if (info.sessionID === this.sessionId && info.role === 'assistant' && info.tokens) {
+					this.lastTokens = info.tokens;
 				}
 				break;
 			}
@@ -280,6 +321,45 @@ class OpencodeDriver {
 					message = err.data && err.data.message ? String(err.data.message) : String(err.name ?? JSON.stringify(err));
 				}
 				this.emit({ kind: 'error', message });
+				break;
+			}
+			case 'question.asked': {
+				// The question tool is blocked until we reply or reject. Delegate
+				// to the UI callback; reject on no callback / no answer / error so
+				// the turn never hangs (the model is told and can proceed).
+				if (props.sessionID !== this.sessionId || !props.id) {
+					break;
+				}
+				const requestId = props.id;
+				this.pendingQuestionIds.add(requestId);
+				const questions = Array.isArray(props.questions) ? props.questions : [];
+				const ask = this.askQuestion
+					? Promise.resolve(this.askQuestion({ id: requestId, questions, tool: props.tool }))
+					: Promise.resolve(null);
+				ask.catch(() => null).then((answers) => {
+					if (!this.pendingQuestionIds.delete(requestId)) {
+						return; // already settled (replied elsewhere, or turn torn down)
+					}
+					const valid = Array.isArray(answers) && answers.length === questions.length
+						&& answers.every((a) => Array.isArray(a) && a.every((s) => typeof s === 'string'));
+					const req = valid
+						? api(baseUrl, 'POST', `/question/${requestId}/reply`, {
+							directory: this.projectDir,
+							body: { answers }
+						})
+						: api(baseUrl, 'POST', `/question/${requestId}/reject`, { directory: this.projectDir });
+					req.catch((err) => {
+						this.emit({ kind: 'error', message: `question reply failed: ${String(err && err.message || err)}` });
+					});
+				});
+				break;
+			}
+			case 'question.replied':
+			case 'question.rejected': {
+				// Settled from elsewhere (another client, or session abort).
+				if (props.requestID) {
+					this.pendingQuestionIds.delete(props.requestID);
+				}
 				break;
 			}
 			case 'permission.asked': {
