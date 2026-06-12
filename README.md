@@ -5,6 +5,10 @@ that replaces GitHub Copilot with [**opencode**](https://opencode.ai) as the
 native, built-in chat agent. The agent is wired directly into VS Code's chat
 panel and Source Control view — no marketplace extension, no Copilot account.
 
+<p align="center">
+  <img alt="Riker in action" src="resources/riker/screenshot.png">
+</p>
+
 > Built on Microsoft's MIT-licensed Code-OSS. See [License](#license) and
 > [Upstream](#upstream-code---oss) below.
 
