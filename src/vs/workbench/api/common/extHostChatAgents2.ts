@@ -308,12 +308,19 @@ export class ChatAgentResponseStream {
 					_report(dto);
 					return this;
 				},
-				async externalEdit(target, callback) {
+				async externalEdit(target, callback, options) {
 					throwIfDone(this.externalEdit);
 					const resources = Array.isArray(target) ? target : [target];
+					// Optional explicit before-content sources (by index with
+					// `resources`): read instead of disk when snapshotting, so the
+					// recorded baseline survives an in-memory model save.
+					let contentFor: vscode.Uri[] | undefined;
+					if (options?.before) {
+						contentFor = Array.isArray(options.before) ? [...options.before] : [options.before];
+					}
 					const operationId = taskHandlePool++;
 					const undoStopId = generateUuid();
-					await send({ kind: 'externalEdits', start: true, resources, undoStopId }, operationId);
+					await send({ kind: 'externalEdits', start: true, resources, undoStopId, contentFor }, operationId);
 					try {
 						await callback();
 						return undoStopId;

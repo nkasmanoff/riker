@@ -39,8 +39,11 @@ const { parseReadToolOutput } = require('./fileEdits');
 const { getServerUrl, api, subscribeEvents } = require('./server');
 
 // Force opencode to ask before every file edit so we can capture the
-// pre-write diff (see "Pre-apply edit gate" above).
-const EDIT_GATE_RULESET = [{ permission: 'edit', pattern: '*', action: 'ask' }];
+// pre-write diff (see "Pre-apply edit gate" above). When command gating is on,
+// bash is forced to ask too so the approval UI fires regardless of the user's
+// opencode config.
+const EDIT_GATE_RULE = { permission: 'edit', pattern: '*', action: 'ask' };
+const BASH_GATE_RULE = { permission: 'bash', pattern: '*', action: 'ask' };
 
 /** Map opencode's lowercase tool names to display names. */
 function normalizeToolName(name) {
@@ -76,12 +79,14 @@ class OpencodeDriver {
 	 * @param {(event: any) => void} emit normalized event sink
 	 * @param {{
 	 *   approveEdit?: (req: { filepath?: string, patterns: string[], diff?: string, callID?: string }) => Promise<'once' | 'reject'>,
+	 *   approveCommand?: (req: { command?: string, patterns: string[], id: string }) => Promise<'once' | 'always' | 'reject'>,
 	 *   askQuestion?: (req: { id: string, questions: any[], tool?: any }) => Promise<string[][] | null | undefined>
 	 * }} [opts]
 	 */
 	constructor(emit, opts = {}) {
 		this.emit = emit;
 		this.approveEdit = typeof opts.approveEdit === 'function' ? opts.approveEdit : null;
+		this.approveCommand = typeof opts.approveCommand === 'function' ? opts.approveCommand : null;
 		this.askQuestion = typeof opts.askQuestion === 'function' ? opts.askQuestion : null;
 		this.sessionId = null;
 		this.emittedSession = false;
@@ -104,6 +109,8 @@ class OpencodeDriver {
 		this.model = '';
 		this.mode = 'build';
 		this.systemPrompt = '';
+		// When true, new sessions force bash to "ask" so the approval UI fires.
+		this.gateCommands = false;
 	}
 
 	configure(opts) {
@@ -122,15 +129,22 @@ class OpencodeDriver {
 		if (typeof opts.systemPrompt === 'string') {
 			this.systemPrompt = opts.systemPrompt;
 		}
+		if (opts.commandApproval) {
+			this.gateCommands = opts.commandApproval === 'ask';
+		}
 		return this.sessionId;
 	}
 
 	/**
 	 * Run one turn. Resolves when the session goes idle.
-	 * @param {string} text
+	 * @param {string} text the user's prompt
+	 * @param {{ contextText?: string, fileParts?: any[] }} [opts] attached
+	 *   context: `contextText` (inlined files/selections/folders) is sent as a
+	 *   leading text part; `fileParts` (e.g. pasted images as `data:` URLs) are
+	 *   sent as opencode `file` parts. Both ride along on the same user message.
 	 * @returns {Promise<{ code: number | null }>}
 	 */
-	async send(text) {
+	async send(text, opts = {}) {
 		if (this.abortController) {
 			return { code: null }; // a turn is already in flight
 		}
@@ -152,14 +166,16 @@ class OpencodeDriver {
 
 		try {
 			// Ensure a session before subscribing so the event filter has an id.
+			let createdNewSession = false;
 			if (!this.sessionId) {
 				const session = await api(baseUrl, 'POST', '/session', {
 					directory: this.projectDir,
-					body: { permission: EDIT_GATE_RULESET }
+					body: { permission: this.buildSessionRuleset() }
 				});
 				this.sessionId = session.id;
+				createdNewSession = true;
 			}
-			this.emitSession();
+			this.emitSession(createdNewSession);
 
 			// Subscribe to events BEFORE sending the prompt so nothing is missed.
 			await subscribeEvents(baseUrl, this.projectDir, (event) => {
@@ -168,7 +184,21 @@ class OpencodeDriver {
 				} catch { /* never let one bad event kill the stream */ }
 			}, ac.signal);
 
-			const body = { parts: [{ type: 'text', text }] };
+			// Order: attached context first, then any media (image) parts, then
+			// the user's actual instruction last so it reads as "here's the
+			// context… now do this". All parts belong to the one user message,
+			// so the SSE echo filter (userMessageIds) drops them from rendering.
+			const parts = [];
+			if (opts.contextText) {
+				parts.push({ type: 'text', text: opts.contextText });
+			}
+			if (Array.isArray(opts.fileParts)) {
+				for (const fp of opts.fileParts) {
+					parts.push(fp);
+				}
+			}
+			parts.push({ type: 'text', text });
+			const body = { parts };
 			const model = this.model ? splitModelId(this.model) : undefined;
 			if (model) {
 				body.model = model;
@@ -251,6 +281,11 @@ class OpencodeDriver {
 
 	// ── internals ──────────────────────────────────────────────────────────
 
+	/** Per-session permission ruleset: edits always ask; bash asks when gated. */
+	buildSessionRuleset() {
+		return this.gateCommands ? [EDIT_GATE_RULE, BASH_GATE_RULE] : [EDIT_GATE_RULE];
+	}
+
 	resetTurn() {
 		this.textByPart.clear();
 		this.partKinds.clear();
@@ -263,14 +298,18 @@ class OpencodeDriver {
 		this.interrupted = false;
 	}
 
-	emitSession() {
+	emitSession(isNew = false) {
 		if (!this.emittedSession && this.sessionId) {
 			this.emittedSession = true;
 			this.emit({
 				kind: 'session',
 				sessionId: this.sessionId,
 				model: this.model,
-				cwd: this.projectDir
+				cwd: this.projectDir,
+				// True only when THIS turn created the session (vs resuming an
+				// existing chat). Brand-new sessions are the ones a chat-title
+				// generation may need to claim.
+				isNew
 			});
 		}
 	}
@@ -394,9 +433,22 @@ class OpencodeDriver {
 							return r;
 						});
 					}
+				} else if (props.permission === 'bash') {
+					// The tool is blocked pre-run; delegate to the command-approval
+					// UI. Without a callback (or when gating is off) we mirror
+					// non-interactive `opencode run` and auto-approve.
+					const md = props.metadata ?? {};
+					const command = typeof md.command === 'string'
+						? md.command
+						: (typeof props.title === 'string' ? props.title : undefined);
+					decision = this.approveCommand
+						? Promise.resolve(this.approveCommand({ command, patterns: props.patterns ?? [], id: props.id }))
+							.then((r) => (r === 'reject' ? 'reject' : (r === 'once' ? 'once' : 'always')))
+							.catch(() => 'always')
+						: Promise.resolve('always');
 				} else {
-					// Mirror non-interactive `opencode run`: don't stall the turn on
-					// non-edit permission prompts.
+					// Other permissions (webfetch, doom_loop, external_directory):
+					// mirror non-interactive `opencode run` — don't stall the turn.
 					this.emit({ kind: 'status', status: `auto-approving permission: ${props.permission ?? ''} ${(props.patterns ?? []).join(', ')}` });
 					decision = Promise.resolve('always');
 				}

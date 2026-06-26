@@ -1501,6 +1501,9 @@ export class CodeApplication extends Disposable {
 					// remoteAuthority: will be determined based on macOpenFiles
 				});
 			}
+
+			// Default: open current working directory (cursor-like behavior)
+			args._ = ['.'];
 		}
 
 		// default: read paths from cli

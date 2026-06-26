@@ -23,7 +23,9 @@
     "chatParticipantPrivate",
     "defaultChatParticipant",
     "chatProvider",
-    "contribSourceControlInputBoxMenu"
+    "chatReferenceBinaryData",
+    "contribSourceControlInputBoxMenu",
+    "terminalSelection"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -41,6 +43,11 @@
         "title": "Generate Commit Message",
         "category": "opencode",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "opencode.addTerminalSelectionToChat",
+        "title": "Add Terminal Selection to opencode Chat",
+        "category": "opencode"
       }
     ],
     "menus": {
@@ -49,8 +56,23 @@
           "command": "opencode.generateCommitMessage",
           "when": "scmProvider == git"
         }
+      ],
+      "terminal/context": [
+        {
+          "command": "opencode.addTerminalSelectionToChat",
+          "group": "navigation",
+          "when": "terminalTextSelected"
+        }
       ]
     },
+    "keybindings": [
+      {
+        "command": "opencode.addTerminalSelectionToChat",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l",
+        "when": "terminalFocus && terminalTextSelected"
+      }
+    ],
     "configuration": {
       "title": "opencode Agent",
       "properties": {
@@ -66,6 +88,80 @@
           ],
           "default": "ask",
           "description": "Whether opencode must ask for approval before editing files. Edits are blocked until you respond; \"Allow for Session\" stops prompting until the window is reloaded."
+        },
+        "opencode.commandApproval": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "enumDescriptions": [
+            "Prompt before opencode runs each shell command (the command is shown in chat first).",
+            "Run shell commands without asking."
+          ],
+          "default": "ask",
+          "description": "Whether opencode must ask for approval before running shell (bash) commands. Commands are blocked until you respond; \"Allow for Session\" stops prompting until the window is reloaded. Applies to new chat sessions."
+        },
+        "opencode.sessionTitle": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "local",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Use opencode's own LLM-generated session title. If opencode's title generation is disabled or times out, fall back to a title derived from your first message.",
+            "Always derive the session title from your first message (no extra model call), ignoring opencode's title generator.",
+            "Never set a session title; keep opencode's placeholder (\"New session - <timestamp>\")."
+          ],
+          "default": "auto",
+          "markdownDescription": "How new chat sessions are titled. `auto` waits for opencode's own title, then falls back to your first message; `local` always derives the title from your first message; `off` keeps opencode's placeholder."
+        },
+        "opencode.suggestFollowups": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show suggested follow-up chips under each response. Suggestions are derived from what the turn did (e.g. reviewing or testing edits) — no extra model call."
+        },
+        "opencode.inlineCompletions.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show ghost-text inline completions (Tab to accept) from a fill-in-the-middle model server. If the server is unreachable, completions back off automatically and never block typing."
+        },
+        "opencode.inlineCompletions.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765/v1/completions",
+          "markdownDescription": "URL of the completion server. For `openai` API mode this is an OpenAI-compatible `/v1/completions` endpoint (uses the `suffix` field for fill-in-the-middle); for `llama` mode it's llama.cpp's `/infill` endpoint."
+        },
+        "opencode.inlineCompletions.api": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "llama"
+          ],
+          "enumDescriptions": [
+            "OpenAI-compatible /v1/completions with a `suffix` field (choices[0].text).",
+            "llama.cpp /infill with input_prefix/input_suffix (content)."
+          ],
+          "default": "openai",
+          "description": "Request/response shape the completion endpoint expects."
+        },
+        "opencode.inlineCompletions.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model name to send with completion requests (optional; many local servers ignore it)."
+        },
+        "opencode.inlineCompletions.maxTokens": {
+          "type": "number",
+          "default": 128,
+          "description": "Maximum number of tokens to request per inline completion."
+        },
+        "opencode.inlineCompletions.disabledLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Language ids to disable inline completions for (e.g. `[\"markdown\", \"plaintext\"]`). Accept the next word with `Cmd/Ctrl+→` and the next line with the built-in `editor.action.inlineSuggest.acceptNextLine` command."
         },
         "opencode.systemPrompt": {
           "type": "string",

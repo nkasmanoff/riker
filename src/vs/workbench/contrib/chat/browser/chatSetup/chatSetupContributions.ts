@@ -367,12 +367,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 					menu: {
 						id: MenuId.AccountsContext,
 						group: '2_copilot',
-						when: ContextKeyExpr.and(
-							ChatContextKeys.Setup.hidden.negate(),
-							ChatContextKeys.Setup.disabledInWorkspace.negate(),
-							ChatContextKeys.Setup.completed.negate(),
-							ChatContextKeys.Entitlement.signedOut
-						)
+						when: ContextKeyExpr.false() // Riker: no GitHub Copilot sign-in
 					}
 				});
 			}
@@ -399,16 +394,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 					menu: [{
 						id: MenuId.TitleBarAdjacentCenter,
 						order: 0, // same position as the update button
-						when: ContextKeyExpr.and(
-							IsWebContext.negate(),
-							ChatContextKeys.Entitlement.signedOut,
-							ChatEntitlementContextKeys.hasByokModels.negate(),
-							ChatContextKeys.Setup.hidden.negate(),
-							ChatContextKeys.Setup.disabledInWorkspace.negate(),
-							ContextKeyExpr.equals(`config.${ChatConfiguration.TitleBarSignInEnabled}`, true),
-							ContextKeyExpr.has('updateTitleBar').negate(),
-							InEditorZenModeContext.negate(),
-						),
+						when: ContextKeyExpr.false() // Riker: no GitHub Copilot sign-in button
 					}]
 				});
 			}
@@ -430,12 +416,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 					localize('toggle.chatSignIn', 'Copilot Sign In'),
 					localize('toggle.chatSignInDescription', "Toggle visibility of the Copilot Sign In button in title bar"),
 					3,
-					ContextKeyExpr.and(
-						IsWebContext.negate(),
-						ChatContextKeys.Entitlement.signedOut,
-						ChatContextKeys.Setup.hidden.negate(),
-						ChatContextKeys.Setup.disabledInWorkspace.negate(),
-					)
+					ContextKeyExpr.false() // Riker: no GitHub Copilot sign-in toggle
 				);
 			}
 		}
@@ -566,46 +547,41 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
 
 		//#region Editor Context Menu
 
-		function registerGenerateCodeCommand(coreCommand: 'chat.internal.explain' | 'chat.internal.fix' | 'chat.internal.review', actualCommand: string): void {
+		function registerGenerateCodeCommand(coreCommand: 'chat.internal.explain' | 'chat.internal.fix' | 'chat.internal.review'): void {
 
-			CommandsRegistry.registerCommand(coreCommand, async (accessor, ...args) => {
+			// Route Explain/Fix/Code Review to the chat panel (the default agent —
+			// opencode), with the selected code inlined into the prompt. The
+			// upstream behavior funneled into the Copilot `@workspace` / setup flow
+			// (errors with "GitHub.copilot-chat cannot be installed" in this build),
+			// and the inline-chat zone doesn't render opencode's streamed markdown.
+			CommandsRegistry.registerCommand(coreCommand, async (accessor) => {
 				const commandService = accessor.get(ICommandService);
 				const codeEditorService = accessor.get(ICodeEditorService);
 				const markerService = accessor.get(IMarkerService);
 
-				switch (coreCommand) {
-					case 'chat.internal.explain':
-					case 'chat.internal.fix': {
-						const textEditor = codeEditorService.getActiveCodeEditor();
-						const uri = textEditor?.getModel()?.uri;
-						const range = textEditor?.getSelection();
-						if (!uri || !range) {
-							return;
-						}
-
-						const markers = AICodeActionsHelper.warningOrErrorMarkersAtRange(markerService, uri, range);
-
-						const actualCommand = coreCommand === 'chat.internal.explain'
-							? AICodeActionsHelper.explainMarkers(markers)
-							: AICodeActionsHelper.fixMarkers(markers, range);
-
-						await commandService.executeCommand(actualCommand.id, ...(actualCommand.arguments ?? []));
-
-						break;
-					}
-					case 'chat.internal.review': {
-						const result = await commandService.executeCommand(CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID);
-						if (result) {
-							await commandService.executeCommand(actualCommand);
-						}
-						break;
-					}
+				const textEditor = codeEditorService.getActiveCodeEditor();
+				const model = textEditor?.getModel();
+				const range = textEditor?.getSelection();
+				if (!model || !range) {
+					return;
 				}
+
+				// Use the selection, falling back to the cursor's line when empty.
+				const code = model.getValueInRange(range) || model.getLineContent(range.startLineNumber);
+				const languageId = model.getLanguageId();
+				const markers = AICodeActionsHelper.warningOrErrorMarkersAtRange(markerService, model.uri, range);
+				const command = coreCommand === 'chat.internal.explain'
+					? AICodeActionsHelper.explain(code, languageId, markers)
+					: coreCommand === 'chat.internal.fix'
+						? AICodeActionsHelper.fix(code, languageId, markers)
+						: AICodeActionsHelper.review(code, languageId);
+
+				await commandService.executeCommand(command.id, ...(command.arguments ?? []));
 			});
 		}
-		registerGenerateCodeCommand('chat.internal.explain', 'github.copilot.chat.explain');
-		registerGenerateCodeCommand('chat.internal.fix', 'github.copilot.chat.fix');
-		registerGenerateCodeCommand('chat.internal.review', 'github.copilot.chat.review');
+		registerGenerateCodeCommand('chat.internal.explain');
+		registerGenerateCodeCommand('chat.internal.fix');
+		registerGenerateCodeCommand('chat.internal.review');
 
 		const internalGenerateCodeContext = ContextKeyExpr.and(
 			ChatContextKeys.Setup.hidden.negate(),

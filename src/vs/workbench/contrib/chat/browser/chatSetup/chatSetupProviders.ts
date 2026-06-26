@@ -118,7 +118,7 @@ export class SetupAgent extends Disposable implements IChatAgentImplementation {
 			const disposables = new DisposableStore();
 
 			// Register VSCode agent
-			const { disposable: vscodeDisposable } = SetupAgent.doRegisterAgent(instantiationService, chatAgentService, 'setup.vscode', 'vscode', false, localize2('vscodeAgentDescription', "Ask questions about VS Code").value, ChatAgentLocation.Chat, ChatModeKind.Agent, context, controller);
+			const { disposable: vscodeDisposable } = SetupAgent.doRegisterAgent(instantiationService, chatAgentService, 'setup.vscode', 'vscode', false, localize2('vscodeAgentDescription', "Ask questions about {0}", product.nameLong).value, ChatAgentLocation.Chat, ChatModeKind.Agent, context, controller);
 			disposables.add(vscodeDisposable);
 
 			// Register workspace agent
@@ -136,7 +136,7 @@ export class SetupAgent extends Disposable implements IChatAgentImplementation {
 				icon: Codicon.newFolder,
 				displayName: localize('setupToolDisplayName', "New Workspace"),
 				modelDescription: 'Scaffold a new workspace in VS Code',
-				userDescription: localize('setupToolsDescription', "Scaffold a new workspace in VS Code"),
+				userDescription: localize('setupToolsDescription', "Scaffold a new workspace in {0}", product.nameLong),
 				canBeReferencedInPrompt: true,
 				toolReferenceName: 'new',
 				when: ContextKeyExpr.true(),
@@ -948,7 +948,7 @@ export class ChatCodeActionsProvider {
 				isAI: true,
 				diagnostics: markers,
 				title: localize('fix', "Fix"),
-				command: AICodeActionsHelper.fixMarkers(markers, range)
+				command: AICodeActionsHelper.fix(model.getValueInRange(range), model.getLanguageId(), markers)
 			});
 
 			// "Explain" if there are diagnostics in the range
@@ -957,7 +957,7 @@ export class ChatCodeActionsProvider {
 				isAI: true,
 				diagnostics: markers,
 				title: localize('explain', "Explain"),
-				command: AICodeActionsHelper.explainMarkers(markers)
+				command: AICodeActionsHelper.explain(model.getValueInRange(range), model.getLanguageId(), markers)
 			});
 		}
 
@@ -1008,31 +1008,39 @@ export class AICodeActionsHelper {
 		return new Selection(range.startLineNumber, range.startColumn, range.endLineNumber, range.endColumn);
 	}
 
-	static explainMarkers(markers: IMarker[]): Command {
+	// Explain/Fix/Code Review open the chat panel (the default agent — opencode)
+	// with the selected code inlined into the prompt. Earlier these used the
+	// Copilot `@workspace /explain` / inline-chat funnels: `@workspace` doesn't
+	// exist in this build (→ "GitHub.copilot-chat cannot be installed"), and the
+	// inline-chat zone doesn't render opencode's streamed markdown (it waits on
+	// its own editing session). The panel is opencode's native, fully-rendering
+	// surface.
+
+	private static buildQuery(instruction: string, code: string, languageId: string, markers: IMarker[]): string {
+		const fence = code.trim() ? `\n\n\`\`\`${languageId || ''}\n${code}\n\`\`\`` : '';
+		const problems = markers.length ? `\n\nReported problems: ${markers.map(marker => marker.message).join(', ')}` : '';
+		return `${instruction}:${fence}${problems}`;
+	}
+
+	private static openPanel(title: string, query: string): Command {
 		return {
 			id: CHAT_OPEN_ACTION_ID,
-			title: localize('explain', "Explain"),
+			title,
 			arguments: [
-				{
-					query: `@workspace /explain ${markers.map(marker => marker.message).join(', ')}`,
-					isPartialQuery: true
-				} satisfies { query: string; isPartialQuery: boolean }
+				{ query, isPartialQuery: false } satisfies { query: string; isPartialQuery: boolean }
 			]
 		};
 	}
 
-	static fixMarkers(markers: IMarker[], range: Range): Command {
-		return {
-			id: INLINE_CHAT_START,
-			title: localize('fix', "Fix"),
-			arguments: [
-				{
-					message: `/fix ${markers.map(marker => marker.message).join(', ')}`,
-					initialSelection: this.rangeToSelection(range),
-					initialRange: range,
-					position: range.getStartPosition()
-				} satisfies { message: string; initialSelection: ISelection; initialRange: IRange; position: IPosition }
-			]
-		};
+	static explain(code: string, languageId: string, markers: IMarker[]): Command {
+		return this.openPanel(localize('explain', "Explain"), this.buildQuery('Explain this code', code, languageId, markers));
+	}
+
+	static fix(code: string, languageId: string, markers: IMarker[]): Command {
+		return this.openPanel(localize('fix', "Fix"), this.buildQuery('Fix this code', code, languageId, markers));
+	}
+
+	static review(code: string, languageId: string): Command {
+		return this.openPanel(localize('review', "Code Review"), this.buildQuery('Review this code for bugs, edge cases, and possible improvements', code, languageId, []));
 	}
 }

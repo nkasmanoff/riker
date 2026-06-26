@@ -6,6 +6,7 @@
 import * as dom from '../../../../../base/browser/dom.js';
 import type { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
+import product from '../../../../../platform/product/common/product.js';
 import type { IPendingToolConfirmation } from '../../../chat/browser/voiceClient/voiceSessionController.js';
 import { FONT_SIZE, addKeyboardActivation } from './tokens.js';
 
@@ -198,7 +199,7 @@ function createSessionRow(session: SessionRowData, props: SessionListProps): HTM
 		} else {
 			const openInVSCode = dom.$('button');
 			openInVSCode.style.cssText = `${btnStyle}background:var(--vscode-button-background);`;
-			openInVSCode.textContent = localize('agentsVoice.openInVSCode', "Open in VS Code");
+			openInVSCode.textContent = localize('agentsVoice.openInVSCode', "Open in {0}", product.nameLong);
 			openInVSCode.addEventListener('click', () => props.onOpenSession(session.resource));
 			confBtns.append(openInVSCode);
 		}

@@ -10,6 +10,9 @@ extensions/**/dist/
 src/vs/base/browser/ui/codicons/codicon/codicon.ttf
 /out*/
 /extensions/**/out/
+# Bundled opencode CLI binary (~114MB), fetched at build time by
+# extensions/opencode-agent/scripts/download-opencode.mjs
+/extensions/opencode-agent/bin/
 build/node_modules
 build/darwin/.dmgbuild
 coverage/

@@ -6,7 +6,7 @@
 import { $, addDisposableListener } from '../../../../../base/browser/dom.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { localize } from '../../../../../nls.js';
-import { ICommandService, CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
+import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
 import { IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
 
@@ -36,12 +36,11 @@ export interface IAgentsBannerResult {
  * to be registered (desktop builds only) and is limited to Insiders quality.
  * It is also hidden when AI features are disabled.
  */
-export function canShowAgentsBanner(chatEntitlementService: IChatEntitlementService): boolean {
-	const sentiment = chatEntitlementService.sentiment;
-	if (sentiment.hidden || sentiment.disabled) {
-		return false;
-	}
-	return !!CommandsRegistry.getCommand(OPEN_WORKSPACE_IN_AGENTS_WINDOW_COMMAND_ID);
+export function canShowAgentsBanner(_chatEntitlementService: IChatEntitlementService): boolean {
+	// Riker: never promote the Copilot-backed Agents window (see
+	// OPEN_AGENTS_WINDOW_PRECONDITION). The welcome-page "Try out the new Agents
+	// window" banner is suppressed.
+	return false;
 }
 
 export interface IAgentsBannerOptions {

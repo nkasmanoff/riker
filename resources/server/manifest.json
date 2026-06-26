@@ -16,5 +16,8 @@
 			"type": "image/png",
 			"sizes": "512x512"
 		}
-	]
+	],
+	"background_color": "#0f0f1a",
+	"theme_color": "#7c3aed",
+	"description": "Riker — A modern code editor"
 }

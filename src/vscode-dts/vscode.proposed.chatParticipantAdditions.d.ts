@@ -601,8 +601,14 @@ declare module 'vscode' {
 		 * resources made within the `callback` and before it resolves will be
 		 * tracked as agent edits. This can be used to track edits made from
 		 * external tools that don't generate simple {@link textEdit textEdits}.
+		 *
+		 * @param options.before Explicit before-content source(s), aligned by
+		 * index with `target`. When provided, the file's pre-edit baseline is
+		 * read from these URIs instead of disk, so the recorded baseline (used by
+		 * checkpoint restore) can't be clobbered by saving an in-memory model
+		 * that already holds the post-edit content.
 		 */
-		externalEdit(target: Uri | Uri[], callback: () => Thenable<unknown>): Thenable<string>;
+		externalEdit(target: Uri | Uri[], callback: () => Thenable<unknown>, options?: { readonly before?: Uri | readonly Uri[] }): Thenable<string>;
 
 		markdownWithVulnerabilities(value: string | MarkdownString, vulnerabilities: ChatVulnerability[]): void;
 		codeblockUri(uri: Uri, isEdit?: boolean): void;

@@ -3,7 +3,7 @@
   "version": "1.125.0",
   "distro": "b85469481bdd242ea1c0b9c07894f86c2b6fa408",
   "author": {
-    "name": "Microsoft Corporation"
+    "name": "Riker"
   },
   "license": "MIT",
   "main": "./out/main.js",
@@ -56,6 +56,7 @@
     "mixin-telemetry-docs": "node build/npm/mixin-telemetry-docs.ts",
     "smoketest": "node build/lib/preLaunch.ts && cd test/smoke && npm run compile && node test/index.js",
     "smoketest-no-compile": "cd test/smoke && node test/index.js",
+    "bundle-opencode": "node extensions/opencode-agent/scripts/download-opencode.mjs",
     "download-builtin-extensions": "node build/lib/builtInExtensions.ts",
     "download-builtin-extensions-cg": "node build/lib/builtInExtensionsCG.ts",
     "monaco-compile-check": "tsgo --project src/tsconfig.monaco.json --noEmit",
@@ -275,10 +276,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/microsoft/vscode.git"
+    "url": "https://github.com/nkasmanoff/riker.git"
   },
   "bugs": {
-    "url": "https://github.com/microsoft/vscode/issues"
+    "url": "https://github.com/nkasmanoff/riker/issues"
   },
   "optionalDependencies": {
     "windows-foreground-love": "0.6.1"
