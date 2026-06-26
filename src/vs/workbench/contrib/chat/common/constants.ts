@@ -258,6 +258,12 @@ export const MANAGE_CHAT_COMMAND_ID = 'workbench.action.chat.manage';
 export const OPEN_WORKSPACE_IN_AGENTS_WINDOW_COMMAND_ID = 'workbench.action.openWorkspaceInAgentsWindow';
 export const OPEN_AGENTS_WINDOW_COMMAND_ID = 'workbench.action.openAgentsWindow';
 export const OPEN_AGENTS_WINDOW_PRECONDITION = ContextKeyExpr.and(
+	// Riker: the Agents window (src/vs/sessions) is a Copilot-CLI / cloud-agent
+	// surface that opencode does not back — it opens with "Copilot CLI" and
+	// "No models available". Disable every entry point that gates on this
+	// precondition (the "Open Agents Window" / "Open Workspace in Agents Window"
+	// commands and their menu items) so it can't be opened from the main window.
+	ContextKeyExpr.false(),
 	ChatEntitlementContextKeys.Setup.hidden.negate(),
 	ChatEntitlementContextKeys.Setup.disabledInWorkspace.negate(),
 	IsSessionsWindowContext.negate(),

@@ -44,6 +44,27 @@ const {
 	buildCommitMessages,
 	cleanCommitMessage
 } = require('../src/commitMessage');
+const {
+	buildRequestContext,
+	langFor,
+	isUri,
+	isLocation,
+	isBinaryData,
+	relPath,
+	parseTerminalAttachment
+} = require('../src/context');
+const { formatShellOutput, fenceFor } = require('../src/toolOutput');
+const { formatTerminalSelection } = require('../src/terminalContext');
+const { renderTodoList, todoSignature } = require('../src/todos');
+const { suggestFollowups } = require('../src/followups');
+const {
+	clampContext,
+	buildRequestBody,
+	parseCompletion,
+	cleanCompletion,
+	isLanguageEnabled
+} = require('../src/inlineCompletions');
+const { parseRateLimit } = require('../src/rateLimit');
 
 let failures = 0;
 function test(name, fn) {
@@ -597,6 +618,458 @@ testAsync('send: assistant tokens surface on turn-complete', async () => {
 	const complete = events.find((e) => e.kind === 'turn-complete');
 	assert.ok(complete, 'turn-complete not emitted');
 	assert.deepStrictEqual(complete.tokens, tokens);
+});
+
+// ── context (attached references) ─────────────────────────────────────────
+
+test('context: type guards distinguish uri / location / binary', () => {
+	const uri = { scheme: 'file', path: '/p/a.ts', fsPath: '/p/a.ts' };
+	const loc = { uri, range: { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } } };
+	const bin = { mimeType: 'image/png', data: async () => new Uint8Array() };
+	assert.ok(isUri(uri) && !isLocation(uri) && !isBinaryData(uri));
+	assert.ok(isLocation(loc) && !isUri(loc));
+	assert.ok(isBinaryData(bin) && !isUri(bin) && !isLocation(bin));
+});
+
+test('context: langFor maps extensions, relPath strips project dir', () => {
+	assert.strictEqual(langFor('src/x.tsx'), 'typescript');
+	assert.strictEqual(langFor('a.unknownext'), '');
+	assert.strictEqual(relPath('/proj/src/a.ts', '/proj'), 'src/a.ts');
+	assert.strictEqual(relPath('/other/a.ts', '/proj'), '/other/a.ts');
+});
+
+function fakeFs(files = {}, dirs = {}) {
+	return {
+		async stat(p) {
+			if (dirs[p]) {
+				return 'directory';
+			}
+			if (p in files) {
+				return 'file';
+			}
+			return 'unknown';
+		},
+		async readText(p) {
+			if (!(p in files)) {
+				throw new Error('ENOENT');
+			}
+			return files[p];
+		},
+		async list(p) { return dirs[p] || []; }
+	};
+}
+
+testAsync('context: empty references produce no context', async () => {
+	const { contextText, fileParts } = await buildRequestContext([], { projectDir: '/proj' });
+	assert.strictEqual(contextText, '');
+	assert.deepStrictEqual(fileParts, []);
+});
+
+testAsync('context: a file reference is inlined as a fenced block', async () => {
+	const fs = fakeFs({ '/proj/src/a.ts': 'export const x = 1;\n' });
+	const refs = [{ id: 'f', value: { scheme: 'file', path: '/proj/src/a.ts', fsPath: '/proj/src/a.ts' } }];
+	const { contextText, summary } = await buildRequestContext(refs, { projectDir: '/proj', fs });
+	assert.ok(contextText.includes('File: src/a.ts'), contextText);
+	assert.ok(contextText.includes('```typescript'), contextText);
+	assert.ok(contextText.includes('export const x = 1;'), contextText);
+	assert.ok(summary.includes('src/a.ts'), summary);
+});
+
+testAsync('context: a selection inlines only the ranged lines', async () => {
+	const fs = fakeFs({ '/proj/a.js': 'l1\nl2\nl3\nl4\nl5\n' });
+	const uri = { scheme: 'file', path: '/proj/a.js', fsPath: '/proj/a.js' };
+	const refs = [{ id: 's', value: { uri, range: { start: { line: 1, character: 0 }, end: { line: 2, character: 3 } } } }];
+	const { contextText } = await buildRequestContext(refs, { projectDir: '/proj', fs });
+	assert.ok(contextText.includes('Selection from a.js (lines 2–3)'), contextText);
+	assert.ok(contextText.includes('l2\nl3'), contextText);
+	assert.ok(!contextText.includes('l1'), contextText);
+	assert.ok(!contextText.includes('l4'), contextText);
+});
+
+testAsync('context: selection ending at column 0 drops the trailing line', async () => {
+	const fs = fakeFs({ '/proj/a.js': 'l1\nl2\nl3\n' });
+	const uri = { scheme: 'file', path: '/proj/a.js', fsPath: '/proj/a.js' };
+	const refs = [{ id: 's', value: { uri, range: { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } } } }];
+	const { contextText } = await buildRequestContext(refs, { projectDir: '/proj', fs });
+	assert.ok(contextText.includes('lines 1–2'), contextText);
+	assert.ok(!contextText.includes('l3'), contextText);
+});
+
+testAsync('context: a folder reference lists its entries', async () => {
+	const fs = fakeFs({}, { '/proj/src': ['a.ts', 'b.ts', 'sub/'] });
+	const refs = [{ id: 'd', value: { scheme: 'file', path: '/proj/src', fsPath: '/proj/src' } }];
+	const { contextText } = await buildRequestContext(refs, { projectDir: '/proj', fs });
+	assert.ok(contextText.includes('Folder: src/'), contextText);
+	assert.ok(contextText.includes('- a.ts'), contextText);
+	assert.ok(contextText.includes('- sub/'), contextText);
+});
+
+testAsync('context: an image becomes a data-url file part, not text', async () => {
+	const bytes = new Uint8Array([1, 2, 3, 4]);
+	const refs = [{ id: 'img', value: { mimeType: 'image/png', data: async () => bytes } }];
+	const { contextText, fileParts } = await buildRequestContext(refs, { projectDir: '/proj' });
+	assert.strictEqual(contextText, '');
+	assert.strictEqual(fileParts.length, 1);
+	assert.strictEqual(fileParts[0].type, 'file');
+	assert.strictEqual(fileParts[0].mime, 'image/png');
+	assert.ok(fileParts[0].url.startsWith('data:image/png;base64,'), fileParts[0].url);
+	assert.strictEqual(fileParts[0].url, 'data:image/png;base64,' + Buffer.from(bytes).toString('base64'));
+});
+
+testAsync('context: non-image binary is skipped', async () => {
+	const refs = [{ id: 'b', value: { mimeType: 'application/zip', data: async () => new Uint8Array([0]) } }];
+	const { contextText, fileParts } = await buildRequestContext(refs, { projectDir: '/proj' });
+	assert.strictEqual(contextText, '');
+	assert.strictEqual(fileParts.length, 0);
+});
+
+testAsync('context: a bad reference is skipped, others survive', async () => {
+	const fs = fakeFs({ '/proj/ok.ts': 'ok\n' });
+	const refs = [
+		{ id: 'missing', value: { scheme: 'file', path: '/proj/missing.ts', fsPath: '/proj/missing.ts' } },
+		{ id: 'ok', value: { scheme: 'file', path: '/proj/ok.ts', fsPath: '/proj/ok.ts' } }
+	];
+	const { contextText } = await buildRequestContext(refs, { projectDir: '/proj', fs });
+	assert.ok(contextText.includes('could not be read'), contextText);
+	assert.ok(contextText.includes('File: ok.ts'), contextText);
+});
+
+testAsync('context: a terminal-command attachment is rendered nicely', async () => {
+	const refs = [{ id: 'terminalCommand:1', value: 'Command: npm test\nOutput:\nFAIL foo\nExit Code: 1' }];
+	const { contextText, summary } = await buildRequestContext(refs, { projectDir: '/proj' });
+	assert.ok(contextText.includes('Terminal command (exit 1)'), contextText);
+	assert.ok(contextText.includes('npm test'), contextText);
+	assert.ok(contextText.includes('FAIL foo'), contextText);
+	assert.ok(summary.includes('terminal: npm test'), summary);
+});
+
+testAsync('context: send forwards context and file parts on the message body', async () => {
+	apiCalls.length = 0;
+	const { driver } = makeDriver(undefined);
+	const turn = driver.send('do the thing', {
+		contextText: 'attached stuff',
+		fileParts: [{ type: 'file', mime: 'image/png', url: 'data:image/png;base64,AAAA' }]
+	});
+	await settle();
+	lastEventSink({ type: 'session.idle', properties: { sessionID: 'ses_test' } });
+	await turn;
+	const post = apiCalls.find((c) => c.path === '/session/ses_test/message');
+	assert.ok(post, 'message POST not found');
+	const parts = post.opts.body.parts;
+	assert.strictEqual(parts[0].text, 'attached stuff');
+	assert.strictEqual(parts[1].type, 'file');
+	assert.strictEqual(parts[parts.length - 1].text, 'do the thing');
+});
+
+// ── todos (live checklist) ────────────────────────────────────────────────
+
+test('todos: renders checkbox states with a progress count', () => {
+	const md = renderTodoList([
+		{ content: 'Set up scaffolding', status: 'completed' },
+		{ content: 'Wire the handler', status: 'in_progress' },
+		{ content: 'Write tests', status: 'pending' },
+		{ content: 'Drop legacy path', status: 'cancelled' }
+	]);
+	assert.ok(md.includes('**Todos · 1/4**'), md);
+	assert.ok(md.includes('- [x] Set up scaffolding'), md);
+	assert.ok(md.includes('- [ ] Wire the handler _(in progress)_'), md);
+	assert.ok(md.includes('- [ ] Write tests'), md);
+	assert.ok(md.includes('- [x] ~~Drop legacy path~~'), md);
+});
+
+test('todos: empty or content-less lists render nothing', () => {
+	assert.strictEqual(renderTodoList([]), '');
+	assert.strictEqual(renderTodoList(undefined), '');
+	assert.strictEqual(renderTodoList([{ status: 'pending', content: '   ' }]), '');
+});
+
+test('todos: signature changes only on meaningful updates', () => {
+	const a = [{ content: 'A', status: 'pending' }, { content: 'B', status: 'pending' }];
+	const b = [{ content: 'A', status: 'completed' }, { content: 'B', status: 'pending' }];
+	assert.strictEqual(todoSignature(a), todoSignature([{ content: 'A' }, { content: 'B' }]));
+	assert.notStrictEqual(todoSignature(a), todoSignature(b));
+});
+
+test('todos: tolerates alternate field names and in-progress spelling', () => {
+	const md = renderTodoList([{ text: 'Legacy text field', status: 'in-progress' }]);
+	assert.ok(md.includes('- [ ] Legacy text field _(in progress)_'), md);
+});
+
+// ── follow-up suggestions ─────────────────────────────────────────────────
+
+test('followups: plan mode suggests implementing the plan', () => {
+	const f = suggestFollowups({ mode: 'plan' });
+	assert.ok(f.length >= 1 && f.length <= 3);
+	assert.ok(f.some((x) => /implement this plan/i.test(x.label)), JSON.stringify(f));
+});
+
+test('followups: edited files suggest review and tests', () => {
+	const f = suggestFollowups({ filesEdited: 3 });
+	const labels = f.map((x) => x.label).join(' | ');
+	assert.ok(/review the changes/i.test(labels), labels);
+	assert.ok(/tests/i.test(labels), labels);
+	assert.ok(f.every((x) => typeof x.prompt === 'string' && x.prompt.length > 0));
+});
+
+test('followups: errors suggest a different approach first', () => {
+	const f = suggestFollowups({ hadError: true, filesEdited: 1 });
+	assert.ok(/different approach/i.test(f[0].label), JSON.stringify(f));
+	assert.ok(f.length <= 3);
+});
+
+test('followups: a plain answer suggests acting on it', () => {
+	const f = suggestFollowups({ filesEdited: 0, hadError: false });
+	const labels = f.map((x) => x.label).join(' | ');
+	assert.ok(/make these changes/i.test(labels), labels);
+});
+
+test('followups: missing metadata never throws and is capped at three', () => {
+	assert.ok(Array.isArray(suggestFollowups()));
+	assert.ok(suggestFollowups({}).length <= 3);
+	assert.ok(suggestFollowups({ hadError: true, filesEdited: 5 }).length <= 3);
+});
+
+// ── inline completions (pure helpers) ─────────────────────────────────────
+
+test('completions: clampContext keeps prefix tail and suffix head', () => {
+	const { prefix, suffix } = clampContext('abcdefgh', '12345678', 3, 4);
+	assert.strictEqual(prefix, 'fgh');
+	assert.strictEqual(suffix, '1234');
+});
+
+test('completions: clampContext leaves short context untouched', () => {
+	const { prefix, suffix } = clampContext('ab', 'cd', 10, 10);
+	assert.strictEqual(prefix, 'ab');
+	assert.strictEqual(suffix, 'cd');
+});
+
+test('completions: buildRequestBody openai uses prompt + suffix', () => {
+	const body = buildRequestBody('openai', { prefix: 'foo(', suffix: ')', model: 'm', maxTokens: 64 });
+	assert.strictEqual(body.prompt, 'foo(');
+	assert.strictEqual(body.suffix, ')');
+	assert.strictEqual(body.max_tokens, 64);
+	assert.strictEqual(body.model, 'm');
+	assert.strictEqual(body.stream, false);
+});
+
+test('completions: buildRequestBody omits model when empty', () => {
+	const body = buildRequestBody('openai', { prefix: 'a', suffix: 'b' });
+	assert.ok(!('model' in body));
+	assert.strictEqual(body.max_tokens, 128);
+});
+
+test('completions: buildRequestBody llama uses infill fields', () => {
+	const body = buildRequestBody('llama', { prefix: 'a', suffix: 'b', maxTokens: 32 });
+	assert.strictEqual(body.input_prefix, 'a');
+	assert.strictEqual(body.input_suffix, 'b');
+	assert.strictEqual(body.n_predict, 32);
+	assert.ok(!('prompt' in body));
+});
+
+test('completions: parseCompletion reads openai and llama shapes', () => {
+	assert.strictEqual(parseCompletion('openai', { choices: [{ text: 'hi' }] }), 'hi');
+	assert.strictEqual(parseCompletion('openai', { choices: [{ message: { content: 'yo' } }] }), 'yo');
+	assert.strictEqual(parseCompletion('llama', { content: 'sup' }), 'sup');
+	assert.strictEqual(parseCompletion('openai', {}), '');
+	assert.strictEqual(parseCompletion('llama', null), '');
+});
+
+test('completions: cleanCompletion trims overlap with the suffix', () => {
+	// Model regurgitated the closing paren that already follows the cursor.
+	assert.strictEqual(cleanCompletion('bar())', ')', 1000), 'bar()');
+	assert.strictEqual(cleanCompletion('x = 1\n}', '\n}', 1000), 'x = 1');
+});
+
+test('completions: cleanCompletion drops whitespace-only and caps length', () => {
+	assert.strictEqual(cleanCompletion('   \n  ', ''), '');
+	assert.strictEqual(cleanCompletion('abcdef', '', 3), 'abc');
+});
+
+test('completions: isLanguageEnabled respects the disabled list', () => {
+	assert.strictEqual(isLanguageEnabled('typescript', []), true);
+	assert.strictEqual(isLanguageEnabled('markdown', ['markdown', 'plaintext']), false);
+	assert.strictEqual(isLanguageEnabled('TypeScript', ['typescript']), false); // case-insensitive
+	assert.strictEqual(isLanguageEnabled('python', ['markdown']), true);
+});
+
+// ── rate-limit parsing ────────────────────────────────────────────────────
+
+test('ratelimit: detects common signals', () => {
+	assert.strictEqual(parseRateLimit('Error 429: Too Many Requests').limited, true);
+	assert.strictEqual(parseRateLimit('rate limit exceeded').limited, true);
+	assert.strictEqual(parseRateLimit('Anthropic API is overloaded (529)').limited, true);
+	assert.strictEqual(parseRateLimit('insufficient_quota').limited, true);
+	assert.strictEqual(parseRateLimit('TypeError: undefined is not a function').limited, false);
+	assert.strictEqual(parseRateLimit('').limited, false);
+});
+
+test('ratelimit: extracts retry-after seconds and minutes', () => {
+	assert.strictEqual(parseRateLimit('rate limit; retry-after: 30').retryAfterSec, 30);
+	assert.strictEqual(parseRateLimit('429 please try again in 2 minutes').retryAfterSec, 120);
+	assert.strictEqual(parseRateLimit('rate limited, retry after 15 seconds').retryAfterSec, 15);
+	assert.strictEqual(parseRateLimit('rate limit hit').retryAfterSec, null);
+});
+
+// ── shell output rendering ────────────────────────────────────────────────
+
+test('toolOutput: empty success output renders nothing, failure notes it', () => {
+	assert.strictEqual(formatShellOutput('', { isError: false }), '');
+	assert.strictEqual(formatShellOutput('   \n ', { isError: false }), '');
+	assert.match(formatShellOutput('', { isError: true }), /Command failed \(no output\)/);
+});
+
+test('toolOutput: renders output in a fenced block with a label', () => {
+	const md = formatShellOutput('hello\nworld', { isError: false });
+	assert.match(md, /\*\*Output\*\*/);
+	assert.match(md, /hello\nworld/);
+	const fail = formatShellOutput('boom', { isError: true });
+	assert.match(fail, /\*\*Output \(failed\)\*\*/);
+});
+
+test('toolOutput: tail-caps long output and notes the omission', () => {
+	const lines = Array.from({ length: 100 }, (_, i) => `line${i}`).join('\n');
+	const md = formatShellOutput(lines, { maxLines: 40 });
+	assert.match(md, /last 40 of 100 lines/);
+	assert.ok(md.includes('line99'), 'keeps the tail');
+	assert.ok(!md.includes('line0\n'), 'drops the head');
+});
+
+test('toolOutput: fenceFor avoids breaking on backticks in output', () => {
+	assert.strictEqual(fenceFor('no backticks'), '```');
+	assert.strictEqual(fenceFor('a ``` b'), '````');
+	const md = formatShellOutput('contains ``` fence', {});
+	assert.ok(md.includes('````'), 'uses a longer fence');
+});
+
+// ── terminal-command attachment parsing ───────────────────────────────────
+
+test('context: parseTerminalAttachment parses command, output, exit code', () => {
+	const value = 'Command: npm test\nOutput:\nPASS 1\nPASS 2\nExit Code: 0';
+	const parsed = parseTerminalAttachment(value);
+	assert.strictEqual(parsed.command, 'npm test');
+	assert.strictEqual(parsed.output, 'PASS 1\nPASS 2');
+	assert.strictEqual(parsed.exitCode, 0);
+});
+
+test('context: parseTerminalAttachment handles missing output / nonzero exit', () => {
+	const parsed = parseTerminalAttachment('Command: ls\nExit Code: 2');
+	assert.strictEqual(parsed.command, 'ls');
+	assert.strictEqual(parsed.output, '');
+	assert.strictEqual(parsed.exitCode, 2);
+});
+
+test('context: parseTerminalAttachment rejects non-terminal strings', () => {
+	assert.strictEqual(parseTerminalAttachment('just some text'), null);
+	assert.strictEqual(parseTerminalAttachment('Command: do a thing then explain'), null);
+});
+
+// ── terminal selection → chat attachment ──────────────────────────────────
+
+test('terminalContext: formatTerminalSelection fences output and labels by name', () => {
+	const snippet = formatTerminalSelection('npm test\nFAIL', 'zsh');
+	assert.strictEqual(snippet.name, 'Terminal: zsh');
+	assert.ok(snippet.text.includes('npm test\nFAIL'), 'includes the selected text');
+	assert.ok(/```[\s\S]*npm test/.test(snippet.text), 'wraps the selection in a fence');
+});
+
+test('terminalContext: formatTerminalSelection widens fence past backticks', () => {
+	const snippet = formatTerminalSelection('echo ```hi```', undefined);
+	assert.strictEqual(snippet.name, 'Terminal selection');
+	assert.ok(snippet.text.includes('````'), 'uses a longer fence than the content');
+});
+
+test('terminalContext: formatTerminalSelection returns null for empty selection', () => {
+	assert.strictEqual(formatTerminalSelection('', 'zsh'), null);
+	assert.strictEqual(formatTerminalSelection('   \n\t ', 'zsh'), null);
+	assert.strictEqual(formatTerminalSelection(undefined, 'zsh'), null);
+});
+
+// ── command gating (bash approval) ────────────────────────────────────────
+
+const BASH_PERMISSION_EVENT = {
+	type: 'permission.asked',
+	properties: {
+		id: 'perm_1',
+		sessionID: 'ses_test',
+		permission: 'bash',
+		patterns: ['rm -rf build'],
+		metadata: { command: 'rm -rf build' }
+	}
+};
+
+function makeCommandDriver(approveCommand) {
+	const events = [];
+	const driver = new OpencodeDriver((e) => events.push(e), { approveCommand });
+	driver.sessionId = 'ses_test';
+	return { driver, events };
+}
+
+test('driver: ruleset gates bash only when commandApproval is ask', () => {
+	const d = new OpencodeDriver(() => { });
+	assert.deepStrictEqual(d.buildSessionRuleset(), [{ permission: 'edit', pattern: '*', action: 'ask' }]);
+	d.configure({ commandApproval: 'ask' });
+	const gated = d.buildSessionRuleset();
+	assert.strictEqual(gated.length, 2);
+	assert.ok(gated.some((r) => r.permission === 'bash' && r.action === 'ask'));
+	d.configure({ commandApproval: 'auto' });
+	assert.strictEqual(d.buildSessionRuleset().length, 1);
+});
+
+testAsync('permission.asked bash: allow replies once', async () => {
+	apiCalls.length = 0;
+	const { driver } = makeCommandDriver(async () => 'once');
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	const post = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
+	assert.ok(post, 'permission reply not posted');
+	assert.strictEqual(post.opts.body.response, 'once');
+});
+
+testAsync('permission.asked bash: allow-for-session replies always', async () => {
+	apiCalls.length = 0;
+	const { driver } = makeCommandDriver(async () => 'always');
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	const post = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
+	assert.strictEqual(post.opts.body.response, 'always');
+});
+
+testAsync('permission.asked bash: deny replies reject', async () => {
+	apiCalls.length = 0;
+	const { driver } = makeCommandDriver(async () => 'reject');
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	const post = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
+	assert.strictEqual(post.opts.body.response, 'reject');
+});
+
+testAsync('permission.asked bash: no callback auto-approves (always)', async () => {
+	apiCalls.length = 0;
+	const { driver } = makeCommandDriver(undefined);
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	const post = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
+	assert.strictEqual(post.opts.body.response, 'always');
+});
+
+testAsync('permission.asked bash: command text is handed to the UI', async () => {
+	apiCalls.length = 0;
+	let seen = null;
+	const { driver } = makeCommandDriver(async (req) => { seen = req; return 'once'; });
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	assert.ok(seen, 'approveCommand was not called');
+	assert.strictEqual(seen.command, 'rm -rf build');
+	assert.deepStrictEqual(seen.patterns, ['rm -rf build']);
+});
+
+testAsync('permission.asked bash: callback throw falls back to always (turn never hangs)', async () => {
+	apiCalls.length = 0;
+	const { driver } = makeCommandDriver(async () => { throw new Error('ui broke'); });
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	const post = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
+	assert.strictEqual(post.opts.body.response, 'always');
 });
 
 (async () => {

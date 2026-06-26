@@ -133,6 +133,13 @@ export interface IChatViewOpenOptions {
 		end: { uri: URI; historyItemId: string };
 	}[];
 	/**
+	 * A list of plain-text snippets to attach to the chat as generic context
+	 * chips (e.g. a terminal selection or command output). Each becomes a
+	 * `generic` attachment whose value is the raw text, so a participant sees it
+	 * verbatim in `request.references`.
+	 */
+	attachText?: { text: string; name: string }[];
+	/**
 	 * The mode ID or name to open the chat in.
 	 */
 	mode?: ChatModeKind | string;
@@ -361,6 +368,19 @@ abstract class OpenChatGlobalAction extends Action2 {
 					},
 					kind: 'scmHistoryItemChangeRange'
 				} satisfies ISCMHistoryItemChangeRangeVariableEntry);
+			}
+		}
+		if (opts?.attachText) {
+			for (const snippet of opts.attachText) {
+				if (snippet?.text) {
+					chatWidget.attachmentModel.addContext({
+						kind: 'generic',
+						id: generateUuid(),
+						name: snippet.name,
+						modelDescription: snippet.name,
+						value: snippet.text,
+					});
+				}
 			}
 		}
 

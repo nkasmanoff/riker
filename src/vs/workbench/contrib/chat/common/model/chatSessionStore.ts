@@ -12,6 +12,7 @@ import { revive } from '../../../../../base/common/marshalling.js';
 import { isEqual, joinPath } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
+import product from '../../../../../platform/product/common/product.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { IEnvironmentService } from '../../../../../platform/environment/common/environment.js';
@@ -371,7 +372,7 @@ export class ChatSessionStore extends Disposable {
 							this.dialogService.prompt({
 								custom: true, // so text is copyable
 								title: localize('chatSessionStore.serializationError', 'Error saving chat session'),
-								message: localize('chatSessionStore.writeError', 'Error serializing chat session for storage. The session will be lost if the window is closed. Please report this issue to the VS Code team:\n\n{0}', e.stack || toErrorMessage(e)),
+								message: localize('chatSessionStore.writeError', 'Error serializing chat session for storage. The session will be lost if the window is closed. Please report this issue to the {1} team:\n\n{0}', e.stack || toErrorMessage(e), product.nameLong),
 								buttons: [
 									{ label: localize('reportIssue', 'Report Issue'), run: () => this.openerService.open('https://github.com/microsoft/vscode/issues/new?template=bug_report.md') }
 								]

@@ -8,6 +8,7 @@ import * as DOM from '../../../../../base/browser/dom.js';
 import { Disposable, DisposableStore, MutableDisposable, isDisposable } from '../../../../../base/common/lifecycle.js';
 import { Emitter } from '../../../../../base/common/event.js';
 import { localize } from '../../../../../nls.js';
+import product from '../../../../../platform/product/common/product.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { WorkbenchList } from '../../../../../platform/list/browser/listService.js';
 import { IListVirtualDelegate, IListRenderer, IListContextMenuEvent } from '../../../../../base/browser/ui/list/list.js';
@@ -791,7 +792,7 @@ export class PluginListWidget extends Disposable {
 		this.browseButton.enabled = browseMarketplaceAvailable;
 		const browseTitle = browseMarketplaceAvailable
 			? localize('browseMarketplace', "Browse Marketplace")
-			: localize('browseMarketplaceUnsupportedWeb', "Browse Marketplace is not available in VS Code for the Web.");
+			: localize('browseMarketplaceUnsupportedWeb', "Browse Marketplace is not available in {0} for the Web.", product.nameLong);
 		this.browseButton.setTitle(browseTitle);
 		this.browseButton.element.setAttribute('aria-label', browseTitle);
 

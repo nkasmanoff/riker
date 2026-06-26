@@ -492,9 +492,13 @@ export class MainThreadChatAgents2 extends Disposable implements MainThreadChatA
 
 			if (progress.kind === 'externalEdits') {
 				if (chatSession?.editingSession && responsePartHandle !== undefined && response) {
+					// `contentFor` (when provided) sources the before/after snapshot
+					// content from explicit URIs instead of disk, so the recorded
+					// baseline can't be clobbered by an in-memory model save.
+					const contentFor: URI[] | undefined = progress.contentFor ? revive<UriComponents[]>(progress.contentFor) : undefined;
 					const parts = progress.start
-						? await chatSession.editingSession.startExternalEdits(response, responsePartHandle, revive(progress.resources), progress.undoStopId)
-						: await chatSession.editingSession.stopExternalEdits(response, responsePartHandle);
+						? await chatSession.editingSession.startExternalEdits(response, responsePartHandle, revive(progress.resources), progress.undoStopId, contentFor)
+						: await chatSession.editingSession.stopExternalEdits(response, responsePartHandle, contentFor);
 					chatProgressParts.push(...parts);
 				}
 				continue;

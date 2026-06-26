@@ -9,7 +9,84 @@
 // token-by-token for both text and reasoning — true streaming.
 
 const { spawn } = require('child_process');
+const http = require('node:http');
+const https = require('node:https');
 const { resolveOpencodeBin } = require('./resolveBin');
+
+// All REST/SSE traffic goes through node:http (not the global `fetch`).
+//
+// Why: the global `fetch` is backed by undici, which enforces a default
+// `headersTimeout`/`bodyTimeout` of 300s. A single agent turn (the POST to
+// `/session/:id/message`) routinely runs longer than that while the model
+// thinks or a tool runs, and the `/event` SSE stream can sit idle for minutes
+// between events — both of which trip undici's idle timers and surface as a
+// bare "fetch failed". This is especially common when the user steps away and
+// the display sleeps. node:http has no such body/headers idle timeout, so a
+// quiet-but-alive connection is never killed.
+//
+// We keep a dedicated keep-alive agent so concurrent chats (multiple chat
+// tabs/windows) each get their own long-lived sockets without contention.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: Infinity });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: Infinity });
+
+/**
+ * Issue an HTTP(S) request with NO idle timeout and return the raw
+ * `IncomingMessage` once response headers arrive. Aborts cleanly when the
+ * optional AbortSignal fires.
+ *
+ * @param {URL} url
+ * @param {{ method?: string, headers?: Record<string, string>, body?: string, signal?: AbortSignal }} [opts]
+ * @returns {Promise<import('node:http').IncomingMessage>}
+ */
+function httpRequest(url, { method = 'GET', headers, body, signal } = {}) {
+	return new Promise((resolve, reject) => {
+		if (signal && signal.aborted) {
+			reject(new Error('aborted'));
+			return;
+		}
+		const isHttps = url.protocol === 'https:';
+		const transport = isHttps ? https : http;
+		// Send an explicit Content-Length (avoids chunked transfer encoding) to
+		// match the previous fetch-based behavior.
+		const finalHeaders = { ...headers };
+		if (body !== undefined && finalHeaders['Content-Length'] === undefined) {
+			finalHeaders['Content-Length'] = Buffer.byteLength(body);
+		}
+		const req = transport.request({
+			protocol: url.protocol,
+			hostname: url.hostname,
+			port: url.port,
+			path: url.pathname + url.search,
+			method,
+			headers: finalHeaders,
+			agent: isHttps ? httpsAgent : httpAgent,
+			// 0 = no socket inactivity timeout. Long turns and idle SSE streams
+			// must survive an indefinitely quiet connection.
+			timeout: 0
+		}, resolve);
+		req.on('error', reject);
+		if (signal) {
+			const onAbort = () => { req.destroy(new Error('aborted')); };
+			signal.addEventListener('abort', onAbort, { once: true });
+			req.on('close', () => signal.removeEventListener('abort', onAbort));
+		}
+		if (body !== undefined) {
+			req.write(body);
+		}
+		req.end();
+	});
+}
+
+/** Read an entire `IncomingMessage` body to a UTF-8 string. */
+function readBody(res) {
+	return new Promise((resolve, reject) => {
+		let data = '';
+		res.setEncoding('utf8');
+		res.on('data', (chunk) => { data += chunk; });
+		res.on('end', () => resolve(data));
+		res.on('error', reject);
+	});
+}
 
 let serverPromise = null;
 /** @type {import('child_process').ChildProcess | null} */
@@ -99,17 +176,21 @@ async function api(baseUrl, method, path, { directory, body } = {}) {
 	if (directory) {
 		url.searchParams.set('directory', directory);
 	}
-	const res = await fetch(url, {
+	const res = await httpRequest(url, {
 		method,
 		headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
 		body: body !== undefined ? JSON.stringify(body) : undefined
 	});
-	if (!res.ok) {
-		const text = await res.text().catch(() => '');
-		throw new Error(`opencode ${method} ${path} -> ${res.status}${text ? `: ${text.slice(0, 300)}` : ''}`);
+	const text = await readBody(res);
+	const status = res.statusCode ?? 0;
+	if (status < 200 || status >= 300) {
+		throw new Error(`opencode ${method} ${path} -> ${status}${text ? `: ${text.slice(0, 300)}` : ''}`);
 	}
-	const contentType = res.headers.get('content-type') || '';
-	return contentType.includes('json') ? res.json() : res.text();
+	const contentType = res.headers['content-type'] || '';
+	if (contentType.includes('json')) {
+		return text ? JSON.parse(text) : undefined;
+	}
+	return text;
 }
 
 /**
@@ -125,41 +206,36 @@ async function api(baseUrl, method, path, { directory, body } = {}) {
 async function subscribeEvents(baseUrl, directory, onEvent, signal) {
 	const url = new URL(baseUrl + '/event');
 	url.searchParams.set('directory', directory);
-	const res = await fetch(url, { signal });
-	if (!res.ok || !res.body) {
-		throw new Error(`opencode /event subscription failed: ${res.status}`);
+	const res = await httpRequest(url, { signal });
+	const status = res.statusCode ?? 0;
+	if (status < 200 || status >= 300) {
+		res.resume(); // drain so the socket can be reused/freed
+		throw new Error(`opencode /event subscription failed: ${status}`);
 	}
 
-	const reader = res.body.getReader();
-	const decoder = new TextDecoder();
+	// Stream events as they arrive. node:http keeps this socket open with no
+	// inactivity timeout, so a long-quiet stream is never dropped from under us.
+	res.setEncoding('utf8');
 	let buf = '';
-	(async () => {
-		try {
-			for (;;) {
-				const { done, value } = await reader.read();
-				if (done) {
-					break;
+	res.on('data', (chunk) => {
+		buf += chunk;
+		let idx;
+		while ((idx = buf.indexOf('\n')) !== -1) {
+			const line = buf.slice(0, idx).trim();
+			buf = buf.slice(idx + 1);
+			if (line.startsWith('data:')) {
+				let event;
+				try {
+					event = JSON.parse(line.slice(5));
+				} catch {
+					continue;
 				}
-				buf += decoder.decode(value, { stream: true });
-				let idx;
-				while ((idx = buf.indexOf('\n')) !== -1) {
-					const line = buf.slice(0, idx).trim();
-					buf = buf.slice(idx + 1);
-					if (line.startsWith('data:')) {
-						let event;
-						try {
-							event = JSON.parse(line.slice(5));
-						} catch {
-							continue;
-						}
-						onEvent(event);
-					}
-				}
+				onEvent(event);
 			}
-		} catch {
-			// Aborted or connection dropped; the driver handles turn teardown.
 		}
-	})();
+	});
+	// Aborted or connection dropped; the driver handles turn teardown.
+	res.on('error', () => { /* swallow: teardown happens via the turn lifecycle */ });
 }
 
 module.exports = { getServerUrl, disposeServer, api, subscribeEvents };

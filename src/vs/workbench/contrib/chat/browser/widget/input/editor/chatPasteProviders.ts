@@ -8,6 +8,7 @@ import { Codicon } from '../../../../../../../base/common/codicons.js';
 import { createStringDataTransferItem, IDataTransferItem, IReadonlyVSDataTransfer, VSDataTransfer } from '../../../../../../../base/common/dataTransfer.js';
 import { convertHtmlToMarkdown } from '../../../../../../../base/browser/htmlToMarkdown.js';
 import { HierarchicalKind } from '../../../../../../../base/common/hierarchicalKind.js';
+import { hash } from '../../../../../../../base/common/hash.js';
 import { Disposable } from '../../../../../../../base/common/lifecycle.js';
 import { revive } from '../../../../../../../base/common/marshalling.js';
 import { Mimes } from '../../../../../../../base/common/mime.js';
@@ -730,6 +731,99 @@ class PasteHtmlProvider implements DocumentPasteEditProvider {
 	}
 }
 
+/**
+ * Riker: register a pasted *plain-text* block (e.g. text copied from the
+ * integrated terminal, which carries no editor metadata) as a "Pasted text"
+ * attachment chip instead of dumping it raw into the input. This matches the
+ * Cursor "copy from terminal → paste → it's registered as context" flow. The
+ * chip's value forwards to the participant as a string reference, which the
+ * opencode bridge inlines. Editor copies (which have `COPY_MIME_TYPES`) are left
+ * to the code/symbol providers, and short single-line pastes still go inline.
+ */
+const PASTE_AS_ATTACHMENT_MIN_LINES = 5;
+const PASTE_AS_ATTACHMENT_MIN_CHARS = 400;
+
+export class PastePlainTextProvider implements DocumentPasteEditProvider {
+
+	public readonly kind = new HierarchicalKind('chat.attach.plaintext');
+	public readonly providedPasteEditKinds = [this.kind];
+
+	public readonly copyMimeTypes = [];
+	public readonly pasteMimeTypes = [Mimes.text];
+
+	constructor(
+		private readonly chatWidgetService: IChatWidgetService,
+	) { }
+
+	async provideDocumentPasteEdits(model: ITextModel, _ranges: readonly IRange[], dataTransfer: IReadonlyVSDataTransfer, context: DocumentPasteContext, token: CancellationToken): Promise<DocumentPasteEditsSession | undefined> {
+		if (model.uri.scheme !== Schemas.vscodeChatInput) {
+			return;
+		}
+		// Only on automatic paste — explicit "Paste As" should keep raw text.
+		if (context.triggerKind !== DocumentPasteTriggerKind.Automatic) {
+			return;
+		}
+		// Text copied from a VS Code editor carries this metadata; let the
+		// dedicated code/symbol providers handle those.
+		if (dataTransfer.get(COPY_MIME_TYPES)) {
+			return;
+		}
+
+		const textItem = dataTransfer.get(Mimes.text);
+		const text = await textItem?.asString();
+		if (!text || token.isCancellationRequested) {
+			return;
+		}
+
+		const lineCount = text.split(/\r\n|\r|\n/).length;
+		// Small snippets are more convenient inline; only sizable blocks (like a
+		// terminal dump or a stack trace) become attachments.
+		if (lineCount < PASTE_AS_ATTACHMENT_MIN_LINES && text.length < PASTE_AS_ATTACHMENT_MIN_CHARS) {
+			return;
+		}
+
+		const widget = this.chatWidgetService.getWidgetByInputUri(model.uri);
+		if (!widget) {
+			return;
+		}
+
+		const pastedContext = getPastedPlainTextContext(text, lineCount);
+		if (widget.attachmentModel.getAttachmentIDs().has(pastedContext.id)) {
+			return;
+		}
+
+		const edit = createCustomPasteEdit(model, [pastedContext], Mimes.text, this.kind, localize('pastedTextAttachment', 'Pasted Text Attachment'), this.chatWidgetService);
+		// Defer to richer interpretations of the same clipboard content.
+		edit.yieldTo = [
+			{ kind: new HierarchicalKind('chat.attach.image') },
+			{ kind: new HierarchicalKind('chat.attach.text') },
+			{ kind: new HierarchicalKind('chat.attach.symbol') },
+			{ kind: new HierarchicalKind('chat.paste.html') },
+		];
+		return createEditSession(edit);
+	}
+}
+
+function getPastedPlainTextContext(text: string, lineCount: number): IChatRequestPasteVariableEntry {
+	const pastedLines = lineCount === 1
+		? localize('pastedAttachment.oneLine', '1 line')
+		: localize('pastedAttachment.multipleLines', '{0} lines', lineCount);
+	const name = localize('pastedTextName', 'Pasted text');
+	return {
+		kind: 'paste',
+		value: text,
+		id: `pastedText:${hash(text)}`,
+		name,
+		modelDescription: name,
+		icon: Codicon.output,
+		pastedLines,
+		language: '',
+		fileName: name,
+		copiedFrom: undefined,
+		code: text,
+	};
+}
+
 export class ChatPasteProvidersFeature extends Disposable {
 	constructor(
 		@IInstantiationService instaService: IInstantiationService,
@@ -746,6 +840,7 @@ export class ChatPasteProvidersFeature extends Disposable {
 		this._register(languageFeaturesService.documentPasteEditProvider.register({ scheme: Schemas.vscodeChatInput, pattern: '*', hasAccessToAllModels: true }, new PasteImageProvider(chatWidgetService, extensionService, fileService, environmentService, logService)));
 		this._register(languageFeaturesService.documentPasteEditProvider.register({ scheme: Schemas.vscodeChatInput, pattern: '*', hasAccessToAllModels: true }, new PasteTextProvider(chatWidgetService, modelService)));
 		this._register(languageFeaturesService.documentPasteEditProvider.register({ scheme: Schemas.vscodeChatInput, pattern: '*', hasAccessToAllModels: true }, new PasteHtmlProvider()));
+		this._register(languageFeaturesService.documentPasteEditProvider.register({ scheme: Schemas.vscodeChatInput, pattern: '*', hasAccessToAllModels: true }, new PastePlainTextProvider(chatWidgetService)));
 		this._register(languageFeaturesService.documentPasteEditProvider.register({ scheme: Schemas.vscodeChatInput, pattern: '*', hasAccessToAllModels: true }, instaService.createInstance(PasteSymbolProvider)));
 		this._register(languageFeaturesService.documentPasteEditProvider.register('*', instaService.createInstance(CopyTextProvider)));
 	}

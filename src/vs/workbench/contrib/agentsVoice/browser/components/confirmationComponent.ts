@@ -5,6 +5,7 @@
 
 import * as dom from '../../../../../base/browser/dom.js';
 import { localize } from '../../../../../nls.js';
+import product from '../../../../../platform/product/common/product.js';
 import type { IPendingToolConfirmation } from '../../../chat/browser/voiceClient/voiceSessionController.js';
 import { FONT_SIZE, FONT_WEIGHT } from './tokens.js';
 
@@ -45,7 +46,7 @@ function createConfirmationRow(tc: IPendingToolConfirmation, onOpenSession: Tool
 	} else {
 		const openBtn = dom.$('button');
 		openBtn.style.cssText = `${btnStyle}background:var(--vscode-button-background);`;
-		openBtn.textContent = localize('agentsVoice.openInVSCode', "Open in VS Code");
+		openBtn.textContent = localize('agentsVoice.openInVSCode', "Open in {0}", product.nameLong);
 		openBtn.addEventListener('click', () => onOpenSession(tc.sessionResource));
 
 		btnRow.append(openBtn);

@@ -5,6 +5,136 @@ and what's left to do. Pick up from here.
 
 ## Done
 
+- **Terminal in the loop** (Cursor parity). Two halves:
+  - *Agent shell output rendered* (`src/toolOutput.js`): `bash` tool results used
+    to collapse to a one-line "done" progress row even though opencode captured
+    stdout/stderr (`state.output` → `tool-result.content`). Now rendered as a
+    fenced block under the progress row — tail-capped (last 40 lines / 4k chars),
+    fence-safe (`fenceFor` sizes the fence past any backticks in the output), and
+    labeled success/failure. Wired in `extension.js` `onEvent` `tool-result`.
+  - *Terminal attachment polish* (`src/context.js`): VS Code's built-in Terminal
+    attachment (`supportsTerminalAttachments`, enabled by default for our widget)
+    arrives as a `terminalCommand` string reference `Command: …\nOutput:…\nExit
+    Code: …`. `context.js` already forwarded it generically; now
+    `parseTerminalAttachment` recognizes it and `terminalBlock` renders a clean
+    `Terminal command (exit N)` block (command in a ```bash fence, output capped)
+    with a `terminal: <cmd>` summary label. Pasting raw text still works as plain
+    prompt text. (Note: attachments are per-command, requiring shell integration;
+    there is no passive "watch every terminal" view — opencode's own `bash` tool
+    covers running new commands.)
+  - *Paste terminal text → "Pasted text" chip* (core patch, Cursor's
+    copy-from-terminal→paste→registered flow). Core's chat paste providers only
+    turned a paste into an attachment when it carried VS Code *editor* copy
+    metadata (`COPY_MIME_TYPES`); terminal copies are bare `text/plain`, so they
+    were dumped inline and never registered as context. Added
+    `PastePlainTextProvider` in `chat/browser/widget/input/editor/
+    chatPasteProviders.ts`: on automatic paste of a sizable plain-text block
+    (≥ 5 lines or ≥ 400 chars, no editor metadata) into the chat input, it
+    registers a `paste` attachment chip ("Pasted text", value = the raw text →
+    forwarded to opencode as a string reference, inlined by `context.js`). Yields
+    to the image/code/symbol/html providers; short pastes still go inline.
+  - *Add terminal selection to chat* (`src/terminalContext.js`, Cursor's
+    select-terminal-text→ask flow). Core never wired terminal text into chat as
+    context (a Copilot-extension feature), so we add it: the
+    `opencode.addTerminalSelectionToChat` command reads `activeTerminal.selection`
+    (`terminalSelection` proposed API) and opens the panel with the text attached
+    as a `generic` chip via the new `attachText` option on
+    `workbench.action.chat.open` (core patch below). The chip reaches the
+    participant as a string `request.reference`, which `context.js` inlines for
+    opencode. Surfaced in the terminal right-click menu (`terminal/context`, when
+    `terminalTextSelected`) and on `Cmd/Ctrl+Alt+L`. `formatTerminalSelection`
+    fences the selection (fence widened past backticks) and labels it by terminal
+    name; unit-tested.
+- **Editor Explain/Fix/Code Review → chat panel** (see core patch below). The
+  participant stays `locations: ["panel"]` only: the inline-chat zone and
+  terminal-chat widget do **not** render opencode's streamed markdown (the inline
+  zone blocks on its own editing session and opencode streams via the chat
+  response stream / surfaces edits through `externalEdit`, not the inline textEdit
+  protocol). So instead of lighting up those zones, the editor AI entry points
+  open the panel — opencode's native, fully-rendering surface — with the selected
+  code inlined. The handler is still location-aware (`request.location` /
+  `request.location2`, harmless for panel) should an inline surface ever be
+  revisited with a dedicated low-tool agent. Notebook omitted.
+- **Rate-limit info in the status bar** (`src/rateLimit.js`) — opencode doesn't
+  expose provider rate-limit headers, so we parse its error text for 429 / 529 /
+  "rate limit" / "overloaded" / "quota" signals (+ an optional retry-after in
+  seconds/minutes). A hit sets a cool-off window; the status bar shows
+  `$(warning) rate limited Ns` with a warning background and self-clears when the
+  window elapses. `parseRateLimit` covered in `test/unit.js`.
+- **Inline-completion polish** — per-language disabling
+  (`opencode.inlineCompletions.disabledLanguages`, `isLanguageEnabled`); accept
+  next word/line work out of the box via VS Code's built-in inline-suggest
+  commands (`Cmd/Ctrl+→`, `editor.action.inlineSuggest.acceptNextLine`),
+  documented in the setting. (Streaming ghost text isn't applicable to
+  `InlineCompletionItemProvider`, which returns complete items.)
+- **Ghost-text inline completions** (`src/inlineCompletions.js`,
+  `opencode.inlineCompletions.*`): replaces Copilot's completions with an
+  `InlineCompletionItemProvider` backed by a fill-in-the-middle model server.
+  Backend-flexible (`api` setting): `openai` posts `{ prompt, suffix, … }` to an
+  OpenAI-compatible `/v1/completions` (the `suffix` field is the FIM context) and
+  reads `choices[0].text`; `llama` posts `{ input_prefix, input_suffix, … }` to
+  llama.cpp's `/infill` and reads `content`. Default endpoint
+  `http://127.0.0.1:8765/v1/completions`. Robustness: 120ms debounce on
+  automatic triggers (skipped on explicit invoke), 2s request timeout linked to
+  the cancellation token, prefix/suffix clamped (4k/1k chars), completion cleaned
+  (length cap + suffix-overlap trim so FIM models don't duplicate trailing
+  brackets), and a circuit breaker that backs off 60s after 3 consecutive
+  failures so a down server never spams requests or adds keystroke latency. Pure
+  helpers (`clampContext`, `buildRequestBody`, `parseCompletion`,
+  `cleanCompletion`) covered in `test/unit.js`. No core patch (stable API).
+- **Checkpoint restore reverts files (Cursor parity)** — clicking "Restore
+  Checkpoint" now rewinds files, not just the chat. Root cause (see old §0): the
+  only edit surface that records into the checkpoint timeline is
+  `stream.externalEdit()`, and its baseline came from `entry.save()` snapshotting
+  the in-memory model — which, when an editor held the post-edit content, saved
+  "after" as the baseline (before == after → no operations recorded → restore
+  was a silent no-op). Fix uses the engine's already-present-but-unbridged
+  `contentFor` path on `start/stopExternalEdits` (`chatEditingSession.ts` reads
+  the baseline from an explicit URI instead of save()). Threaded it through:
+  `externalEdit(target, callback, { before })` (proposed API) →
+  `extHostChatAgents2.ts` sends `contentFor` on the start message →
+  `mainThreadChatAgents2.ts` passes it to `start/stopExternalEdits`. `surfaceFileEdits`
+  now reconstructs the pre-turn original, writes it to a temp file, and registers
+  the edit with `{ before: tempUri }` (disk keeps "after" throughout — never
+  rewound, so no open-editor race); temp files are deleted after the turn.
+  Requires `npm run compile` (engine changed). (`src/extension.js`, core patches
+  below)
+- **Follow-up suggestion chips** (`src/followups.js`, `opencode.suggestFollowups`):
+  a `ChatFollowupProvider` on the participant suggests up to three next steps
+  under each response, derived from the turn's result metadata (`mode`,
+  `filesEdited`, `hadError`) — e.g. "Review the changes for bugs" / "Add or update
+  tests" after edits, "Implement this plan" after `/plan`, "Try a different
+  approach" after errors. Deterministic, instant, and free (no model call / no
+  API key). Covered in `test/unit.js`.
+- **Attached context forwarded to opencode** (`src/context.js`): the handler used
+  to send only `request.prompt`, silently dropping everything the user explicitly
+  attached. Now `request.references` is converted into opencode message parts:
+  files (Uri) and selections (Location) are inlined as fenced code blocks
+  (path + content / line range), folders are listed shallowly, plain-string
+  context is inlined verbatim, and pasted images (`ChatReferenceBinaryData`,
+  proposal `chatReferenceBinaryData`) become `data:`-URL `file` parts (opencode
+  passes media parts straight to the model). Text is inlined directly rather than
+  relying on opencode resolving `file://` parts, so it's version-independent and
+  the model sees content immediately; size is capped per-file (64 KB) and overall
+  (256 KB). Context rides along as a leading text part on the same user message,
+  so the SSE echo filter (`userMessageIds`) drops it from rendering.
+  `driver.send(text, { contextText, fileParts })`. Covered in `test/unit.js`.
+- **Live TODO checklist** (`src/todos.js`): opencode's `todowrite` tool used to
+  collapse into a generic "TodoWrite — done" progress row. It now renders as a
+  Markdown checklist (`- [x]` / `- [ ]`, in-progress + cancelled states, a
+  `done/total` count) in the response, re-rendered when the list meaningfully
+  changes (dedup via `todoSignature`, since chat markdown is append-only) so the
+  plan visibly fills in as opencode advances. `todoread`/result rows for
+  `todowrite` are suppressed. Covered in `test/unit.js`.
+- **Command (bash) approval gate** (`opencode.commandApproval`, default `ask`):
+  parity with the edit gate, for shell commands. New sessions force `bash` to
+  `ask` (`buildSessionRuleset`) when gating is on, so the prompt fires regardless
+  of the user's opencode config. The blocked command is streamed into chat as a
+  ```bash block, then a notification offers Allow / Allow for Session / Deny —
+  `once` / `always` / `reject` to the server. `auto` (or no callback) preserves
+  the old auto-approve-`always` behavior; other permissions (webfetch,
+  doom_loop, external_directory) still auto-approve. `approveCommand` driver
+  callback mirrors `approveEdit`. Covered in `test/unit.js`.
 - **Chat participant** `opencode.agent` (`isDefault: true`) drives opencode
   and streams output into the native chat view. Session continuity via the
   opencode session id (stored in result metadata, replayed across turns).
@@ -228,65 +358,103 @@ and what's left to do. Pick up from here.
   default-for-Chat model so opencode can satisfy `request.model` with Copilot
   absent. (Requires `npm run compile`; needs
   `NODE_OPTIONS=--max-old-space-size=8192` or tsc OOMs.)
+- **Editor Explain/Fix/Code Review routed to opencode (chat panel)** — the editor
+  context menu + AI code actions (`chat.internal.explain` / `fix` / `review`)
+  funneled into the Copilot `@workspace /explain` / anonymous-setup flow, which in
+  this build only errors with "GitHub.copilot-chat cannot be installed". Repointed
+  them at the chat panel (`CHAT_OPEN_ACTION_ID`, default agent = opencode) with the
+  selected code inlined into an auto-submitted prompt. (First tried inline chat,
+  but the inline zone doesn't render opencode's output — see the editor-chat note
+  above; the panel does.)
+  - `src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupProviders.ts` —
+    `AICodeActionsHelper.explain(code, languageId, markers)` / `fix(...)` /
+    `review(code, languageId)` build a `CHAT_OPEN_ACTION_ID` command (selection
+    fenced in the query, diagnostics appended). Code-action call sites pass
+    `model.getValueInRange(range)` + `model.getLanguageId()`.
+  - `src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts` —
+    `registerGenerateCodeCommand` builds the selected text (falling back to the
+    cursor line) and routes all three to those helpers (review no longer runs the
+    anonymous-setup funnel). (Requires `npm run compile`, Node 24.)
+- **Copilot "Agents window" entry points disabled** — the dedicated Agents window
+  (`src/vs/sessions`, a separate Electron app) is a Copilot-CLI / cloud-agent
+  surface that opencode does not back: it opens titled "New session … with
+  **Copilot CLI**" and "No models available". opencode can't be registered as an
+  agent-host/session provider without implementing that whole protocol, so the
+  window is dead weight in this build. Suppressed both reachable entry points:
+  - `src/vs/workbench/contrib/chat/common/constants.ts` — added
+    `ContextKeyExpr.false()` to `OPEN_AGENTS_WINDOW_PRECONDITION`, which gates the
+    `Open Agents Window` / `Open Workspace in Agents Window` commands and all their
+    menu items (command palette, title-bar submenu, etc.).
+  - `src/vs/workbench/contrib/chat/browser/agentSessions/agentSessionsBanner.ts` —
+    `canShowAgentsBanner` now returns `false`, killing the welcome-page
+    "Try out the new Agents window" promo banner. (Requires `npm run compile`,
+    Node 24.)
+- **`attachText` option on `workbench.action.chat.open`** — core's chat-open
+  command could attach files, screenshots, and SCM history, but not arbitrary text
+  snippets, so an extension had no way to drop terminal output into the chat as a
+  context chip.
+  - `src/vs/workbench/contrib/chat/browser/actions/chatActions.ts` —
+    `IChatViewOpenOptions` gains `attachText?: { text; name }[]`; the handler adds
+    each as a `generic` attachment (`attachmentModel.addContext`, `value` = the
+    raw text, `modelDescription` = name) so it shows as a chip and forwards to the
+    participant as a string reference. Used by `opencode.addTerminalSelectionToChat`
+    (see "Add terminal selection to chat"). (Requires `npm run compile`, Node 24.)
+- **externalEdit `before`/`contentFor` (checkpoint restore)** — three tiny edits
+  that thread an existing-but-unbridged engine capability out to the extension
+  API:
+  - `src/vscode-dts/vscode.proposed.chatParticipantAdditions.d.ts` —
+    `externalEdit` gains an `options?: { before?: Uri | readonly Uri[] }` param.
+  - `src/vs/workbench/api/common/extHostChatAgents2.ts` — `externalEdit` sends
+    the before-content URIs as `contentFor` on the start message.
+  - `src/vs/workbench/api/browser/mainThreadChatAgents2.ts` — passes
+    `revive(progress.contentFor)` to `start/stopExternalEdits` (the session
+    method already accepted it). (Requires `npm run compile`, Node 24.)
 
 ## Next Steps (deferred)
 
-### 0. Checkpoint restore should restore files (parity with Cursor)
-Clicking "Restore Checkpoint" rewinds the chat but does not revert files.
-The workbench machinery exists and works natively: restore →
-`ChatEditingSession.restoreSnapshot` → checkpoint timeline
-`navigateToCheckpoint` rewrites disk from recorded baselines/operations
-(`chatEditingCheckpointTimelineImpl.ts`). Files only revert if their edits
-were *recorded in the timeline*, and the only extension surface that records
-them is `stream.externalEdit()` — which we call in an end-of-turn batch.
-Suspected failure points (in order):
-1. `startExternalEdits` calls `entry.save()` before snapshotting
-   (`chatEditingSession.ts:719-724`); if the file's in-memory model still
-   holds the *after* content (open editor / entry reused from an earlier
-   request), the save clobbers our restored "before" → before == after →
-   no operations recorded → restore is a silent no-op for that file.
-2. Files whose end-of-turn chain reconstruction fails fall back to
-   `stream.reference()` and never enter the timeline.
-Planned fix (~0.5–1 day): drive `externalEdit` per edit at tool-result time
-using the pre-apply gate's exact before-content (gate now guarantees a
-validated "before" for every edit), replacing the end-of-turn
-restore-then-replay batch in `surfaceFileEdits`. Worst case needs a small
-core patch in `chatEditingSession.ts` (+ `npm run compile`) if the `save()`
-race persists.
+### 0. Checkpoint restore — residual edge
+Done (see above). Remaining edge: a file *created* this turn restores to empty
+rather than being deleted (we record a `''`→after edit, not a Create, because
+opencode already wrote the file to disk so we can't observe a `undefined`
+baseline). Acceptable; true deletion would require deleting the file before the
+externalEdit so the engine records a Create operation.
 
 ### 1. Approval UX upgrades
-The per-edit approve/deny gate is live (see Done) using a notification
-prompt. Possible refinements:
+The per-edit and per-command approve/deny gates are live (see Done), both via
+notification prompts. Possible refinements:
 - Render the prompt as an in-chat confirmation part instead of a
   notification (mid-turn `stream.confirmation` replies arrive as a *new*
   chat request, so this needs a queued-request dance — investigate).
-- Extend asking to other permissions (bash, webfetch) behind the same
-  setting, instead of auto-"always".
+- Extend asking to `webfetch` (currently auto-"always") behind a setting.
+- Auto-approve an allowlist of obviously-safe read-only commands
+  (`ls`, `cat`, `git status`, …) so command `ask` mode is less noisy.
 
 ### 2. Remaining polish
-- **Rate-limit info**: not parsed from the opencode stream yet; the status bar
-  currently shows cost only.
+- **Rate-limit info**: DONE (see Done) — parsed from opencode error text into a
+  status-bar warning. Could be improved if opencode ever exposes structured
+  provider rate-limit headers (exact remaining/reset rather than a heuristic
+  cool-off).
 
 ### 2b. Copilot-surface audit (2026-06-12) — remaining candidates
 Full sweep of `product.defaultChatAgent` consumers + `Setup.completed.negate()`
 nudges. Fixed: SCM input sparkle, merge-conflict "Resolve Conflicts with AI"
-(both disabled via `ContextKeyExpr.false()`, see core patches). Remaining,
+(both disabled via `ContextKeyExpr.false()`, see core patches); editor
+Explain/Fix/Code Review (rerouted to opencode inline chat, see Done). Remaining,
 in rough priority order:
-- **Inline editor chat (Cmd+I)** — no `EditorInline` default agent, so inline
-  chat is dark. Participant `locations` accepts `"editor"`
-  (`ChatAgentLocation.fromRaw`); adding it + `isDefault` would light it up
-  with opencode. Caveats: inline chat sessions set `canUseTools: false` and
-  expect fast, localized responses — opencode's full agent loop edits files
-  via its own tools, so UX needs thought (maybe a dedicated low-tool agent).
-- **Terminal chat (Cmd+I in terminal)** — same story via `"terminal"`
-  location; `terminalChatEnabler.ts` only needs a default Terminal agent to
-  enable the UI. opencode could suggest/explain commands.
-- **Ghost-text inline completions** — Copilot's completions are simply gone
-  (provider-driven; engine's `completionsEnablement.ts` reads a Copilot
-  setting name from `defaultChatAgent`, no provider registered). Could
-  register an `InlineCompletionItemProvider` in opencode-agent backed by the
-  local llama.cpp server (`north-mini-code` @ 127.0.0.1:8765, FIM-capable,
-  zero cost/latency-friendly) or OpenRouter. Largest effort, biggest win.
+- **Inline editor chat (Cmd+I)** — tried (`"editor"` location + selection
+  context) but **reverted**: the inline-chat zone doesn't render opencode's
+  streamed markdown/edits (it speaks the inline textEdit protocol + blocks on its
+  own editing session; opencode streams via the chat response stream and surfaces
+  edits through `externalEdit`). Editor Explain/Fix/Review now route to the panel
+  instead (see Done). A real inline experience would need a dedicated agent that
+  returns inline `TextEdit`s — non-trivial; deferred.
+- **Terminal chat (Cmd+I in terminal)** — likewise reverted (same rendering gap,
+  unverified). Deferred with the inline-editor work above.
+- **Ghost-text inline completions** — DONE (see Done above): an
+  `InlineCompletionItemProvider` backed by a configurable FIM server
+  (`opencode.inlineCompletions.*`). Possible follow-ups: stream/partial
+  completions, accept-word/line keybindings, per-language enablement, an
+  OpenRouter backend mode, and a "completions paused/active" status-bar hint.
 - **Dormant/cosmetic, no action**: chat setup welcome views + terms
   disclaimers (chatQuick/chatWidget/agentSessionsWelcome), Getting Started
   walkthrough Copilot steps, `defaultAccount.ts` entitlement sync, extension
@@ -341,13 +509,23 @@ in rough priority order:
   git checkout opencode && git merge main   # resolve conflicts in our 4 core files
   npm i && npm run compile                  # engine changed → recompile
   ```
-  Our core-patch surface is intentionally tiny (6 files: `product.json`,
+  Our core-patch surface is intentionally tiny (15 files: `product.json`,
   `extHostLanguageModels.ts`, `chatStatusEntry.ts`, `chatTipCatalog.ts`,
   `scmInput.ts` — Copilot setup sparkle disabled in the SCM input menu,
-  `scm.contribution.ts` — same for "Resolve Conflicts with AI") +
-  the self-contained `extensions/opencode-agent/` + `oc`, so merges should
-  rarely conflict. After any merge, sanity-check the proposed APIs we use
-  (`externalEdit`, `thinkingProgress`, `chatProvider`) still exist.
+  `scm.contribution.ts` — same for "Resolve Conflicts with AI", `chatSetup/
+  chatSetupProviders.ts` + `chatSetup/chatSetupContributions.ts` — editor
+  Explain/Fix/Code Review rerouted to opencode inline chat, `chat/common/
+  constants.ts` + `agentSessions/agentSessionsBanner.ts` — the Copilot "Agents
+  window" entry points and promo banner disabled, `chat/browser/actions/
+  chatActions.ts` — the `attachText` chat-open option for terminal-selection
+  context, `chat/browser/widget/input/editor/chatPasteProviders.ts` — pasted
+  plain-text blocks (terminal output) registered as "Pasted text" chips, plus the
+  externalEdit `before`/`contentFor` threading in
+  `vscode.proposed.chatParticipantAdditions.d.ts`, `extHostChatAgents2.ts`, and
+  `mainThreadChatAgents2.ts`) + the self-contained `extensions/opencode-agent/`
+  + `oc`, so merges should rarely conflict. After any merge, sanity-check the
+  proposed APIs we use (`externalEdit` incl. the `before` option,
+  `thinkingProgress`, `chatProvider`) still exist.
 - **opencode**: installed at `~/.opencode/bin/opencode`; update with
   `opencode upgrade`. Our integration is tested against **v1.15.10–v1.17.4**
   (1.15.x had a fatal upstream bug — see Gotchas) and

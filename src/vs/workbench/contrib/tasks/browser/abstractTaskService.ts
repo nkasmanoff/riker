@@ -20,6 +20,7 @@ import * as Types from '../../../../base/common/types.js';
 import { URI } from '../../../../base/common/uri.js';
 import * as UUID from '../../../../base/common/uuid.js';
 import * as nls from '../../../../nls.js';
+import product from '../../../../platform/product/common/product.js';
 import { CommandsRegistry, ICommandService } from '../../../../platform/commands/common/commands.js';
 import { ConfigurationTarget, IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IFileService, IFileStatWithPartialMetadata } from '../../../../platform/files/common/files.js';
@@ -3481,7 +3482,7 @@ export abstract class AbstractTaskService extends Disposable implements ITaskSer
 							return;
 						}
 						if (response.code && response.code === TerminateResponseCode.ProcessNotFound) {
-							this._notificationService.error(nls.localize('TerminateAction.noProcess', 'The launched process doesn\'t exist anymore. If the task spawned background tasks exiting VS Code might result in orphaned processes.'));
+							this._notificationService.error(nls.localize('TerminateAction.noProcess', 'The launched process doesn\'t exist anymore. If the task spawned background tasks exiting {0} might result in orphaned processes.', product.nameLong));
 						} else {
 							this._notificationService.error(nls.localize('TerminateAction.failed', 'Failed to terminate running task'));
 						}

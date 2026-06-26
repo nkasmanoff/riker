@@ -8,6 +8,7 @@ import Severity from '../../../base/common/severity.js';
 import { URI } from '../../../base/common/uri.js';
 import * as nls from '../../../nls.js';
 import * as semver from '../../../base/common/semver/semver.js';
+import product from '../../../platform/product/common/product.js';
 import { IExtensionManifest, parseApiProposals } from './extensions.js';
 import { allApiProposals } from './extensionsApiProposals.js';
 
@@ -378,11 +379,12 @@ export function areApiProposalsCompatible(apiProposals: string[], arg1?: string[
 	if (incompatibleProposals.length) {
 		if (notices) {
 			if (incompatibleProposals.length === 1) {
-				notices.push(nls.localize('apiProposalMismatch1', "This extension is using the API proposal '{0}' that is not compatible with the current version of VS Code.", incompatibleProposals[0]));
+				notices.push(nls.localize('apiProposalMismatch1', "This extension is using the API proposal '{0}' that is not compatible with the current version of {1}.", incompatibleProposals[0], product.nameLong));
 			} else {
-				notices.push(nls.localize('apiProposalMismatch2', "This extension is using the API proposals {0} and '{1}' that are not compatible with the current version of VS Code.",
+				notices.push(nls.localize('apiProposalMismatch2', "This extension is using the API proposals {0} and '{1}' that are not compatible with the current version of {2}.",
 					incompatibleProposals.slice(0, incompatibleProposals.length - 1).map(p => `'${p}'`).join(', '),
-					incompatibleProposals[incompatibleProposals.length - 1]));
+					incompatibleProposals[incompatibleProposals.length - 1],
+					product.nameLong));
 			}
 		}
 		return false;

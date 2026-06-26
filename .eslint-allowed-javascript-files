@@ -165,14 +165,22 @@ test/unit/node/index.js
 test/unit/reporter.js
 
 # Riker fork: opencode-agent built-in extension (plain JS, no upstream sign-off)
+extensions/opencode-agent/scripts/download-opencode.mjs
 extensions/opencode-agent/src/commitMessage.js
+extensions/opencode-agent/src/context.js
 extensions/opencode-agent/src/descriptor.js
 extensions/opencode-agent/src/extension.js
 extensions/opencode-agent/src/fileEdits.js
+extensions/opencode-agent/src/followups.js
+extensions/opencode-agent/src/inlineCompletions.js
 extensions/opencode-agent/src/lmProvider.js
 extensions/opencode-agent/src/opencode.js
+extensions/opencode-agent/src/rateLimit.js
 extensions/opencode-agent/src/resolveBin.js
 extensions/opencode-agent/src/server.js
 extensions/opencode-agent/src/systemPrompt.js
+extensions/opencode-agent/src/terminalContext.js
+extensions/opencode-agent/src/todos.js
+extensions/opencode-agent/src/toolOutput.js
 extensions/opencode-agent/test/smoke.js
 extensions/opencode-agent/test/unit.js

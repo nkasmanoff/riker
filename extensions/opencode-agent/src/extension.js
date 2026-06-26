@@ -8,6 +8,7 @@
 
 const vscode = require('vscode');
 const path = require('path');
+const os = require('os');
 const { OpencodeDriver } = require('./opencode');
 const { getOpencodeDescriptor } = require('./descriptor');
 const { registerLanguageModelProvider } = require('./lmProvider');
@@ -21,6 +22,13 @@ const {
 	parseSystemPromptDoc
 } = require('./systemPrompt');
 const { registerCommitMessageGenerator } = require('./commitMessage');
+const { buildRequestContext } = require('./context');
+const { renderTodoList, todoSignature } = require('./todos');
+const { suggestFollowups } = require('./followups');
+const { registerInlineCompletions } = require('./inlineCompletions');
+const { parseRateLimit } = require('./rateLimit');
+const { formatShellOutput } = require('./toolOutput');
+const { registerTerminalContext } = require('./terminalContext');
 
 /** @type {vscode.OutputChannel} */
 let output;
@@ -35,6 +43,10 @@ let lastTurnCostUsd = 0;
 let lastTurnTokens = null;
 /** Model id used on the most recent turn (for limit/pricing lookups). */
 let lastModelId = '';
+/** Epoch ms until which the provider is considered rate-limited (0 = not). */
+let rateLimitedUntil = 0;
+/** Default cool-off when a rate-limit error carries no explicit retry-after. */
+const RATE_LIMIT_DEFAULT_COOLOFF_MS = 60000;
 
 /**
  * Model catalog from the opencode server (`/config/providers`):
@@ -62,6 +74,62 @@ function getModelCatalog() {
 
 /** Set by "Allow for Session" on the edit-approval prompt; window-scoped. */
 let sessionAutoApproveEdits = false;
+/** Set by "Allow for Session" on the command-approval prompt; window-scoped. */
+let sessionAutoApproveCommands = false;
+
+/**
+ * Recently created opencode sessions awaiting a chat-title generation to claim
+ * them. A brand-new chat's `provideChatTitle` runs concurrently with its first
+ * turn and has no opencode session id in its history yet, so it claims the
+ * pending session whose first user prompt matches (falling back to the most
+ * recent unclaimed one). Tracking a LIST — not a single global — is what lets
+ * several brand-new chats opened at once (multiple chat tabs/windows) each get
+ * their own title instead of stealing each other's.
+ * @type {{ id: string, projectDir: string, userPrompt?: string, claimed: boolean }[]}
+ */
+const recentSessions = [];
+const RECENT_SESSIONS_MAX = 32;
+
+/** Record a brand-new session as available for a title generation to claim. */
+function recordSession(entry) {
+	recentSessions.push({ ...entry, claimed: false });
+	while (recentSessions.length > RECENT_SESSIONS_MAX) {
+		recentSessions.shift();
+	}
+}
+
+/**
+ * Claim the pending session that best matches a brand-new chat awaiting its
+ * title: prefer an unclaimed session whose first prompt matches, otherwise the
+ * most recent unclaimed session. Each session is claimed at most once so
+ * concurrent new chats can't grab the same one. Returns undefined if none is
+ * available yet.
+ * @param {string | undefined} userPrompt
+ */
+function claimSessionForTitle(userPrompt) {
+	let idx = -1;
+	if (userPrompt) {
+		for (let i = recentSessions.length - 1; i >= 0; i--) {
+			if (!recentSessions[i].claimed && recentSessions[i].userPrompt === userPrompt) {
+				idx = i;
+				break;
+			}
+		}
+	}
+	if (idx === -1) {
+		for (let i = recentSessions.length - 1; i >= 0; i--) {
+			if (!recentSessions[i].claimed) {
+				idx = i;
+				break;
+			}
+		}
+	}
+	if (idx === -1) {
+		return undefined;
+	}
+	recentSessions[idx].claimed = true;
+	return recentSessions[idx];
+}
 
 let descriptorPromise = null;
 function descriptor() {
@@ -104,9 +172,28 @@ async function handler(request, context, stream, token) {
 	// exactly what opencode's `--model` flag expects. Fall back to opencode's
 	// own default when no model is resolvable.
 	const model = (request.model && request.model.id) || desc.defaultModel;
-	const mode = request.command === 'plan' ? 'plan' : desc.defaultMode;
-	const systemPrompt = vscode.workspace.getConfiguration('opencode').get('systemPrompt', '');
+	const commandApproval = vscode.workspace.getConfiguration('opencode').get('commandApproval', 'ask');
 	lastModelId = model;
+
+	// Where is this chat happening? `location` is the ChatLocation enum
+	// (1=Panel, 2=Terminal, 3=Notebook, 4=Editor). Inline surfaces (Cmd+I in an
+	// editor or the terminal) want a more focused behavior than the panel.
+	const location = request.location;
+	const isTerminalChat = location === 2; // ChatLocation.Terminal
+	const editorData = request.location2; // ChatRequestEditorData in editor inline chat
+
+	let mode = request.command === 'plan' ? 'plan' : desc.defaultMode;
+	let systemPrompt = vscode.workspace.getConfiguration('opencode').get('systemPrompt', '');
+	if (isTerminalChat) {
+		// Terminal inline chat: read-only suggestions, never an edit/agent loop.
+		// Plan mode keeps opencode from touching files; the hint steers it to a
+		// runnable command the terminal can offer to execute.
+		mode = 'plan';
+		systemPrompt = (systemPrompt ? systemPrompt + '\n\n' : '')
+			+ 'You are answering from a terminal prompt. Be concise. If the user wants to run '
+			+ 'something, reply with a single shell command in a ```bash code block plus a one-line '
+			+ 'explanation. Do not propose file edits.';
+	}
 
 	// Captured from the opencode stream; returned in result metadata so the next
 	// turn can resume it. `fileEdits` accumulates file mutations (every edit per
@@ -118,17 +205,50 @@ async function handler(request, context, stream, token) {
 		fileEdits: new Map(),
 		readSnapshots: new Map(),
 		renderedDiffCallIds: new Set(),
-		projectDir
+		lastTodos: '',
+		hadError: false,
+		projectDir,
+		// The user's prompt for this turn, used to derive a session title when
+		// opencode's own title generator is disabled or times out.
+		userPrompt: request.prompt
 	};
 
 	const driver = new OpencodeDriver((event) => onEvent(event, stream, captured), {
 		approveEdit: (req) => approveEditRequest(req, stream, captured),
+		approveCommand: (req) => approveCommandRequest(req, stream),
 		askQuestion: (req) => askQuestionRequest(req, stream)
 	});
-	driver.configure({ projectDir, model, mode, resumeSessionId, systemPrompt });
+	driver.configure({ projectDir, model, mode, resumeSessionId, systemPrompt, commandApproval });
+
+	// Forward anything the user explicitly attached (@file, @folder, a code
+	// selection, a pasted image, …) so opencode sees it directly instead of
+	// having to re-discover it. VS Code already renders the attachment pills
+	// above the user's message, so nothing extra is echoed into chat.
+	let contextText = '';
+	let fileParts = [];
+	try {
+		// In editor inline chat the active file + selection aren't in
+		// `references`, so synthesize them so opencode focuses on the right spot.
+		const extraRefs = [];
+		if (editorData && editorData.document) {
+			extraRefs.push({ id: 'inline.file', value: editorData.document.uri });
+			if (editorData.selection && !editorData.selection.isEmpty) {
+				extraRefs.push({ id: 'inline.selection', value: { uri: editorData.document.uri, range: editorData.selection } });
+			}
+		}
+		const allRefs = extraRefs.length ? [...request.references, ...extraRefs] : request.references;
+		const built = await buildRequestContext(allRefs, { projectDir });
+		contextText = built.contextText;
+		fileParts = built.fileParts;
+		if (built.summary) {
+			output.appendLine(`[context] ${built.summary}`);
+		}
+	} catch (err) {
+		output.appendLine(`[context] failed to build: ${err && err.message ? err.message : String(err)}`);
+	}
 
 	output.appendLine(
-		`[turn] dir=${projectDir} model=${model} mode=${mode} resume=${resumeSessionId ?? '(new)'}${systemPrompt ? ' systemPrompt=set' : ''}`
+		`[turn] dir=${projectDir} model=${model} mode=${mode} resume=${resumeSessionId ?? '(new)'}${systemPrompt ? ' systemPrompt=set' : ''}${contextText || fileParts.length ? ` context=${request.references.length}ref` : ''}`
 	);
 
 	// Interrupt the opencode process if the user cancels the request.
@@ -139,7 +259,7 @@ async function handler(request, context, stream, token) {
 			stream.info('Plan mode: opencode is running its read-only "plan" agent. It will propose changes without editing files.');
 		}
 		stream.progress('opencode is thinking…');
-		const { code } = await driver.send(request.prompt);
+		const { code } = await driver.send(request.prompt, { contextText, fileParts });
 		if (code && code !== 0) {
 			output.appendLine(`[turn] opencode exited with code ${code}`);
 		}
@@ -147,87 +267,135 @@ async function handler(request, context, stream, token) {
 		// disk state is final.
 		await surfaceFileEdits(captured.fileEdits, stream);
 	} catch (err) {
-		stream.warning(`opencode error: ${err && err.message ? err.message : String(err)}`);
+		captured.hadError = true;
+		const msg = err && err.message ? err.message : String(err);
+		noteRateLimit(msg);
+		stream.warning(`opencode error: ${msg}`);
 	} finally {
 		cancelSub.dispose();
 	}
 
-	return { metadata: { opencodeSessionId: captured.sessionId } };
+	return {
+		metadata: {
+			opencodeSessionId: captured.sessionId,
+			mode,
+			filesEdited: captured.fileEdits.size,
+			hadError: captured.hadError
+		}
+	};
 }
 
 /**
- * Surface the file edits opencode made during a turn as accept/reject diffs.
+ * Surface the file edits opencode made during a turn as accept/reject diffs
+ * that ALSO revert on checkpoint restore.
  *
  * opencode writes to disk eagerly, so by now `filePath` already holds the final
- * ("after") content. To get VS Code's editing UI to show a before/after diff we:
- *   1. reconstruct the file's pre-turn ("before") content by chaining the
- *      edits' diffs in reverse from the current disk content;
- *   2. write that "before" content back to disk;
- *   3. open an externalEdit window (VS Code snapshots the restored original);
- *   4. inside the callback, restore the real "after" content.
- * VS Code then diffs before -> after and renders accept/reject pills.
+ * ("after") content. We reconstruct the file's pre-turn ("before") content by
+ * chaining the edits' diffs in reverse from disk, then register the change via
+ * `externalEdit(uri, cb, { before })`:
+ *   - `before` points at a temp file holding the reconstructed original, so the
+ *     editing session records THAT as the baseline (the engine reads it instead
+ *     of save()-ing the in-memory model — which, if an editor held the "after"
+ *     content, used to clobber the baseline and make checkpoint restore a silent
+ *     no-op);
+ *   - the callback re-writes the "after" content (idempotent — disk already has
+ *     it) so the change is attributed as the tracked agent edit;
+ *   - the engine diffs before -> after, renders accept/reject pills, AND records
+ *     the operation in the checkpoint timeline so "Restore Checkpoint" rewinds
+ *     the file.
  *
- * If reconstruction can't be proven correct (e.g. a blind overwrite with no
- * diff), we skip the replay for that file and emit a plain reference instead —
- * never risking the file's contents.
+ * Disk is never rewound to "before" (the old approach did, racing open editors);
+ * the original only ever lives in the temp file. If reconstruction can't be
+ * proven correct (e.g. a blind overwrite with no diff), we emit a plain
+ * reference instead — never risking the file's contents.
  *
  * @param {Map<string, any[]>} fileEdits filePath -> ordered edit records
  * @param {vscode.ChatResponseStream} stream
  */
 async function surfaceFileEdits(fileEdits, stream) {
-	for (const [filePath, edits] of fileEdits) {
-		const uri = vscode.Uri.file(filePath);
-		let afterText;
-		try {
-			afterText = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
-		} catch {
-			// File was deleted or is unreadable; fall back to a reference.
-			stream.reference(uri);
-			continue;
-		}
-
-		// Chain edits in reverse: current disk = after of the last edit. Walk
-		// backwards, reconstructing the "before" of each, to recover the
-		// pre-turn original.
-		let beforeText = afterText;
-		let reconstructable = true;
-		for (let i = edits.length - 1; i >= 0; i--) {
-			const result = reconstructBefore(edits[i], beforeText);
-			if (!result) {
-				reconstructable = false;
-				break;
-			}
-			beforeText = result.before;
-		}
-
-		if (!reconstructable || beforeText === afterText) {
-			// Can't safely show a diff (blind overwrite, or no net change).
-			// Surface the file as a reference so the user can still inspect it.
-			stream.reference(uri);
-			output.appendLine(`[edit] ${filePath}: no safe diff (reference only)`);
-			continue;
-		}
-
-		try {
-			// externalEdit snapshots the file as "before" when it starts (before
-			// the callback runs), then diffs that against disk after the callback
-			// resolves. So we restore the original to disk *first*, then re-apply
-			// the real result inside the callback as the tracked agent edit.
-			await vscode.workspace.fs.writeFile(uri, Buffer.from(beforeText, 'utf8'));
-			await stream.externalEdit(uri, async () => {
-				await vscode.workspace.fs.writeFile(uri, Buffer.from(afterText, 'utf8'));
-			});
-			output.appendLine(`[edit] ${filePath}: surfaced (${edits.length} edit(s))`);
-		} catch (err) {
-			// If externalEdit isn't available or fails, make sure the final
-			// content is on disk and fall back to a reference.
+	/** @type {vscode.Uri[]} */
+	const tempFiles = [];
+	try {
+		for (const [filePath, edits] of fileEdits) {
+			const uri = vscode.Uri.file(filePath);
+			let afterText;
 			try {
-				await vscode.workspace.fs.writeFile(uri, Buffer.from(afterText, 'utf8'));
-			} catch { /* best effort */ }
-			stream.reference(uri);
-			output.appendLine(`[edit] ${filePath}: externalEdit failed (${err && err.message})`);
+				afterText = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+			} catch {
+				// File was deleted or is unreadable; fall back to a reference.
+				stream.reference(uri);
+				continue;
+			}
+
+			// Chain edits in reverse: current disk = after of the last edit. Walk
+			// backwards, reconstructing the "before" of each, to recover the
+			// pre-turn original.
+			let beforeText = afterText;
+			let reconstructable = true;
+			for (let i = edits.length - 1; i >= 0; i--) {
+				const result = reconstructBefore(edits[i], beforeText);
+				if (!result) {
+					reconstructable = false;
+					break;
+				}
+				beforeText = result.before;
+			}
+
+			if (!reconstructable || beforeText === afterText) {
+				// Can't safely show a diff (blind overwrite, or no net change).
+				// Surface the file as a reference so the user can still inspect it.
+				stream.reference(uri);
+				output.appendLine(`[edit] ${filePath}: no safe diff (reference only)`);
+				continue;
+			}
+
+			try {
+				const beforeUri = await writeBaselineTempFile(beforeText);
+				tempFiles.push(beforeUri);
+				// Baseline comes from `before`; disk keeps the "after" content. The
+				// callback rewrites "after" so the change is tracked as the agent's.
+				await stream.externalEdit(uri, async () => {
+					await vscode.workspace.fs.writeFile(uri, Buffer.from(afterText, 'utf8'));
+				}, { before: beforeUri });
+				output.appendLine(`[edit] ${filePath}: surfaced (${edits.length} edit(s))`);
+			} catch (err) {
+				// If externalEdit isn't available or fails, make sure the final
+				// content is on disk and fall back to a reference.
+				try {
+					await vscode.workspace.fs.writeFile(uri, Buffer.from(afterText, 'utf8'));
+				} catch { /* best effort */ }
+				stream.reference(uri);
+				output.appendLine(`[edit] ${filePath}: externalEdit failed (${err && err.message})`);
+			}
+		}
+	} finally {
+		// The engine reads the baseline during externalEdit (resolved by now), so
+		// the temp files are safe to remove.
+		for (const t of tempFiles) {
+			try { await vscode.workspace.fs.delete(t); } catch { /* best effort */ }
 		}
 	}
+}
+
+/** Unique scratch dir for externalEdit baseline ("before") content. */
+let baselineTempDir;
+
+/**
+ * Write `text` to a fresh temp file and return its Uri, for use as an
+ * externalEdit `before` content source. The engine reads it via the file
+ * service during the edit; we delete it once the turn's edits are surfaced.
+ * @param {string} text
+ * @returns {Promise<vscode.Uri>}
+ */
+async function writeBaselineTempFile(text) {
+	if (!baselineTempDir) {
+		baselineTempDir = vscode.Uri.file(path.join(os.tmpdir(), 'riker-externaledit'));
+		await vscode.workspace.fs.createDirectory(baselineTempDir);
+	}
+	const name = `before-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	const uri = vscode.Uri.joinPath(baselineTempDir, name);
+	await vscode.workspace.fs.writeFile(uri, Buffer.from(text, 'utf8'));
+	return uri;
 }
 
 /**
@@ -278,6 +446,49 @@ async function approveEditRequest(req, stream, captured) {
 	}
 	// Explicit deny, or the prompt was dismissed: never apply silently.
 	stream.warning(`Edit to ${fileLabel} denied${choice ? '' : ' (approval prompt dismissed)'}.`);
+	return 'reject';
+}
+
+/**
+ * Approve or deny one pending shell command (driver `approveCommand` callback).
+ * Called while the bash tool is BLOCKED on the permission gate, before the
+ * command runs. Streams the command into chat, then (in "ask" mode) prompts.
+ *
+ * @param {{ command?: string, patterns: string[], id: string }} req
+ * @param {vscode.ChatResponseStream} stream
+ * @returns {Promise<'once' | 'always' | 'reject'>}
+ */
+async function approveCommandRequest(req, stream) {
+	const command = (req.command || (req.patterns && req.patterns[0]) || '').toString();
+
+	// Show the exact command before it runs (the true pre-run gate).
+	if (command.trim()) {
+		const shown = command.length > 2000 ? command.slice(0, 2000) + '\n# … (truncated)' : command;
+		stream.markdown(`\n\n**Run command**\n\n\`\`\`bash\n${shown}\n\`\`\`\n\n`);
+	}
+
+	const mode = vscode.workspace.getConfiguration('opencode').get('commandApproval', 'ask');
+	if (mode !== 'ask' || sessionAutoApproveCommands) {
+		return 'always';
+	}
+
+	const label = command.length > 60 ? command.slice(0, 60) + '…' : command;
+	stream.progress('Waiting for approval to run a command…');
+	const choice = await vscode.window.showInformationMessage(
+		`opencode wants to run: ${label || 'a shell command'}`,
+		{ modal: false },
+		'Allow',
+		'Allow for Session',
+		'Deny'
+	);
+	if (choice === 'Allow for Session') {
+		sessionAutoApproveCommands = true;
+		return 'always';
+	}
+	if (choice === 'Allow') {
+		return 'once';
+	}
+	stream.warning(`Command denied${choice ? '' : ' (approval prompt dismissed)'}.`);
 	return 'reject';
 }
 
@@ -406,6 +617,198 @@ function lastOpencodeSessionId(context) {
 	return undefined;
 }
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * opencode seeds every session with a placeholder title and replaces it with an
+ * LLM-generated one after the first user message. This matches the placeholder
+ * (`Session.isDefaultTitle` in opencode) so we know the real title isn't ready
+ * yet. Keep in sync with opencode's `createDefaultTitle`.
+ */
+const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Name a chat session, preferring opencode's own auto-generated session title
+ * but falling back to one derived from the user's first message.
+ *
+ * VS Code calls this once, for the first request of a brand-new chat, via the
+ * default participant (see chatServiceImpl.generateInitialChatTitleIfNeeded).
+ * At that point the chat history carries no opencode session id, so we wait for
+ * the in-flight turn to create its session, then — depending on the
+ * `opencode.sessionTitle` setting — either poll the opencode server for its
+ * generated title and/or derive one locally and push it back via `PATCH`.
+ *
+ * @param {vscode.ChatContext} context
+ * @param {vscode.CancellationToken} token
+ * @returns {Promise<string | undefined>}
+ */
+async function provideChatTitle(context, token) {
+	const mode = vscode.workspace.getConfiguration('opencode').get('sessionTitle', 'auto');
+	if (mode === 'off') {
+		return undefined;
+	}
+
+	// Resumed chats already carry the session id in their turn metadata; a new
+	// chat has to wait for its first turn to create the opencode session.
+	let sessionId = lastOpencodeSessionId(context);
+	let projectDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+	// The first user prompt of this specific chat (from the single-entry history
+	// VS Code hands the title generator) — used to claim the matching session
+	// when several brand-new chats are opening at once.
+	let userPrompt = firstPromptFromContext(context);
+
+	if (!sessionId) {
+		const session = await waitForTurnSession(token, userPrompt);
+		if (!session) {
+			return undefined;
+		}
+		sessionId = session.id;
+		projectDir = session.projectDir;
+		userPrompt = session.userPrompt ?? userPrompt;
+	}
+
+	// `local`: skip opencode's generator entirely and title from the prompt.
+	if (mode === 'local') {
+		return setLocalTitle(sessionId, projectDir, userPrompt, token);
+	}
+
+	// `auto`: prefer opencode's generated title, but fall back to a locally
+	// derived one if its generator is disabled or doesn't finish in time.
+	const generated = await fetchGeneratedTitle(sessionId, projectDir, token);
+	if (generated) {
+		return generated;
+	}
+	return setLocalTitle(sessionId, projectDir, userPrompt, token);
+}
+
+/**
+ * Derive a session title from the user's first message and push it to the
+ * opencode server (so it shows up in opencode's own session list / DB too).
+ * Returns the title VS Code should display, or undefined if none could be made.
+ * @param {string} sessionId
+ * @param {string} projectDir
+ * @param {string | undefined} userPrompt
+ * @param {vscode.CancellationToken} token
+ * @returns {Promise<string | undefined>}
+ */
+async function setLocalTitle(sessionId, projectDir, userPrompt, token) {
+	const title = deriveTitleFromPrompt(userPrompt);
+	if (!title || token.isCancellationRequested) {
+		return undefined;
+	}
+	try {
+		const baseUrl = await getServerUrl();
+		await api(baseUrl, 'PATCH', `/session/${sessionId}`, {
+			directory: projectDir,
+			body: { title }
+		});
+		output.appendLine(`[title] session ${sessionId} -> "${title}" (local)`);
+	} catch (err) {
+		// Non-fatal: VS Code still gets the title even if the server rename
+		// fails, so the chat tab is labelled correctly regardless.
+		output.appendLine(`[title] failed to persist local title for ${sessionId}: ${err && err.message ? err.message : String(err)}`);
+	}
+	return title;
+}
+
+/**
+ * Build a short, single-line title from the user's first message. Collapses
+ * whitespace, drops a leading slash-command, and truncates to a sensible
+ * length. Returns undefined for empty prompts.
+ * @param {string | undefined} userPrompt
+ * @returns {string | undefined}
+ */
+function deriveTitleFromPrompt(userPrompt) {
+	if (typeof userPrompt !== 'string') {
+		return undefined;
+	}
+	const firstLine = userPrompt.split(/\r?\n/).map(line => line.trim()).find(line => line.length > 0) ?? '';
+	const cleaned = firstLine.replace(/\s+/g, ' ').trim();
+	if (!cleaned) {
+		return undefined;
+	}
+	const MAX_TITLE_LENGTH = 80;
+	if (cleaned.length <= MAX_TITLE_LENGTH) {
+		return cleaned;
+	}
+	return cleaned.slice(0, MAX_TITLE_LENGTH - 1).trimEnd() + '…';
+}
+
+/** The first user prompt from the title generator's single-entry history. */
+function firstPromptFromContext(context) {
+	const history = context?.history ?? [];
+	const req = history[0] && history[0].request;
+	return req && typeof req.prompt === 'string' && req.prompt ? req.prompt : undefined;
+}
+
+/**
+ * Wait for this chat's first turn to create its opencode session, then claim
+ * it. Claiming prefers a session whose first prompt matches `userPrompt`, so
+ * several brand-new chats opened concurrently each resolve to their own
+ * session instead of racing on a single global.
+ * @param {vscode.CancellationToken} token
+ * @param {string | undefined} userPrompt
+ * @returns {Promise<{ id: string, projectDir: string, userPrompt?: string } | undefined>}
+ */
+async function waitForTurnSession(token, userPrompt) {
+	const deadline = Date.now() + 15000;
+	for (;;) {
+		const claimed = claimSessionForTitle(userPrompt);
+		if (claimed) {
+			return claimed;
+		}
+		if (Date.now() >= deadline || token.isCancellationRequested) {
+			return undefined;
+		}
+		await delay(300);
+	}
+}
+
+/**
+ * Poll the opencode server for `sessionId`'s title until its title-generator
+ * has replaced the placeholder (or we time out / are cancelled).
+ * @param {string} sessionId
+ * @param {string} projectDir
+ * @param {vscode.CancellationToken} token
+ * @returns {Promise<string | undefined>}
+ */
+async function fetchGeneratedTitle(sessionId, projectDir, token) {
+	let baseUrl;
+	try {
+		baseUrl = await getServerUrl();
+	} catch {
+		return undefined;
+	}
+	const deadline = Date.now() + 30000;
+	while (Date.now() < deadline && !token.isCancellationRequested) {
+		const session = await getOpencodeSession(baseUrl, sessionId, projectDir);
+		const title = session && typeof session.title === 'string' ? session.title.trim() : '';
+		if (title && !DEFAULT_TITLE_RE.test(title)) {
+			output.appendLine(`[title] session ${sessionId} -> "${title}"`);
+			return title;
+		}
+		await delay(800);
+	}
+	return undefined;
+}
+
+/**
+ * Read one opencode session by id (falling back to the list endpoint if the
+ * by-id route is unavailable). Returns undefined on any failure.
+ */
+async function getOpencodeSession(baseUrl, sessionId, projectDir) {
+	try {
+		return await api(baseUrl, 'GET', `/session/${sessionId}`, { directory: projectDir });
+	} catch {
+		try {
+			const sessions = await api(baseUrl, 'GET', '/session', { directory: projectDir });
+			return Array.isArray(sessions) ? sessions.find((s) => s && s.id === sessionId) : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+}
+
 /**
  * Translate a normalized opencode event into chat response stream output.
  * @param {any} event
@@ -417,6 +820,18 @@ function onEvent(event, stream, captured) {
 		case 'session':
 			if (event.sessionId) {
 				captured.sessionId = event.sessionId;
+				// Only a freshly created session feeds title generation; resumed
+				// chats already have a title (and their id lives in chat history).
+				// Keep the first user prompt around so provideChatTitle can match
+				// this session to the right new chat — and so we can derive a
+				// title ourselves if opencode's generator is disabled / times out.
+				if (event.isNew) {
+					recordSession({
+						id: event.sessionId,
+						projectDir: captured.projectDir,
+						userPrompt: captured.userPrompt
+					});
+				}
 			}
 			break;
 		case 'text-delta':
@@ -428,10 +843,28 @@ function onEvent(event, stream, captured) {
 			stream.thinkingProgress({ id: event.id || 'opencode-thinking', text: event.text });
 			break;
 		case 'tool-start':
-			stream.progress(toolStartLabel(event));
+			// Render the agent's plan as a live checklist instead of a generic
+			// "TodoWrite" progress row (Cursor-style).
+			if (event.rawName === 'todowrite') {
+				renderTodosIfChanged(event.input, stream, captured);
+			} else {
+				stream.progress(toolStartLabel(event));
+			}
 			break;
 		case 'tool-result': {
-			stream.progress(toolResultLabel(event));
+			// The checklist was already rendered at tool-start; a "done" row adds
+			// nothing for todowrite.
+			if (event.rawName !== 'todowrite') {
+				stream.progress(toolResultLabel(event));
+			}
+			// Surface the shell command's output (Cursor-style "see the log"):
+			// opencode already captured stdout/stderr, we just render it.
+			if (event.rawName === 'bash') {
+				const outputMd = formatShellOutput(event.content, { isError: event.isError });
+				if (outputMd) {
+					stream.markdown(outputMd);
+				}
+			}
 			// Snapshot-on-read: remember the file's exact content from a complete
 			// `read` so a later overwrite `write` can show a real before/after.
 			if (event.fileRead && event.fileRead.filePath) {
@@ -479,6 +912,8 @@ function onEvent(event, stream, captured) {
 			updateUsageStatus().catch(() => { /* status bar is best effort */ });
 			break;
 		case 'error':
+			captured.hadError = true;
+			noteRateLimit(event.message);
 			stream.warning(`opencode: ${event.message}`);
 			break;
 		case 'status':
@@ -529,12 +964,31 @@ async function lookupContextLimit(modelId) {
 	}
 }
 
-/** Reflect cost and context usage in the status bar. */
+/**
+ * Record a rate-limit / overload signal parsed from an opencode error, set the
+ * cool-off window, and refresh the status bar.
+ * @param {string} message
+ */
+function noteRateLimit(message) {
+	const { limited, retryAfterSec } = parseRateLimit(message);
+	if (!limited) {
+		return;
+	}
+	const coolOff = (retryAfterSec && retryAfterSec > 0 ? retryAfterSec * 1000 : RATE_LIMIT_DEFAULT_COOLOFF_MS);
+	rateLimitedUntil = Math.max(rateLimitedUntil, Date.now() + coolOff);
+	output.appendLine(`[ratelimit] active for ~${Math.round(coolOff / 1000)}s`);
+	updateUsageStatus().catch(() => { /* status bar is best effort */ });
+	// Re-render once the window elapses so the warning clears itself.
+	setTimeout(() => updateUsageStatus().catch(() => { }), coolOff + 250);
+}
+
+/** Reflect cost, context usage, and rate-limit state in the status bar. */
 async function updateUsageStatus() {
 	if (!costStatusItem) {
 		return;
 	}
-	if (sessionCostUsd <= 0 && !lastTurnTokens) {
+	const rateLimited = Date.now() < rateLimitedUntil;
+	if (sessionCostUsd <= 0 && !lastTurnTokens && !rateLimited) {
 		return; // stay hidden until the first turn reports something
 	}
 	const used = contextTokens(lastTurnTokens);
@@ -545,6 +999,13 @@ async function updateUsageStatus() {
 	if (pct !== undefined) {
 		segments.push(`${pct}%`);
 	}
+	if (rateLimited) {
+		const secsLeft = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
+		segments.push(`$(warning) rate limited ${secsLeft}s`);
+		costStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+	} else {
+		costStatusItem.backgroundColor = undefined;
+	}
 	costStatusItem.text = segments.join(' · ');
 
 	const lines = ['**opencode**', '', `Last turn: ${formatUsd(lastTurnCostUsd)}`, '', `Session total: ${formatUsd(sessionCostUsd)}`];
@@ -553,6 +1014,10 @@ async function updateUsageStatus() {
 		const t = lastTurnTokens;
 		const cache = t.cache ?? {};
 		lines.push('', `Last turn tokens: ${formatTokens(t.input ?? 0)} in · ${formatTokens(t.output ?? 0)} out · ${formatTokens(t.reasoning ?? 0)} reasoning · ${formatTokens(cache.read ?? 0)} cache read`);
+	}
+	if (rateLimited) {
+		const secsLeft = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
+		lines.push('', `⚠️ Provider rate limited — backing off ~${secsLeft}s.`);
 	}
 	lines.push('', 'Run `/usage` in chat for details.');
 	costStatusItem.tooltip = new vscode.MarkdownString(lines.join('\n'));
@@ -851,6 +1316,28 @@ async function renderUsageReport(stream, modelId) {
 	stream.markdown(lines.join('\n') + '\n');
 }
 
+/**
+ * Render opencode's todo list as a Markdown checklist when it changed since the
+ * last render this turn (chat markdown is append-only, so re-rendering on every
+ * identical update would just spam the transcript).
+ * @param {{ todos?: any[] }} input the todowrite tool input
+ * @param {vscode.ChatResponseStream} stream
+ * @param {{ lastTodos: string }} captured
+ */
+function renderTodosIfChanged(input, stream, captured) {
+	const todos = input && Array.isArray(input.todos) ? input.todos : [];
+	const md = renderTodoList(todos);
+	if (!md) {
+		return;
+	}
+	const sig = todoSignature(todos);
+	if (sig === captured.lastTodos) {
+		return;
+	}
+	captured.lastTodos = sig;
+	stream.markdown(md);
+}
+
 function toolStartLabel(event) {
 	const target = describeTarget(event);
 	return target ? `${event.name} ${target}` : `${event.name}`;
@@ -898,6 +1385,20 @@ function activate(ctx) {
 
 	const participant = vscode.chat.createChatParticipant('opencode.agent', handler);
 	participant.iconPath = new vscode.ThemeIcon('robot');
+	// Suggested next-step chips under each response, derived from what the turn
+	// did (see followups.js). Honors the `opencode.suggestFollowups` setting.
+	participant.followupProvider = {
+		provideFollowups(result) {
+			if (!vscode.workspace.getConfiguration('opencode').get('suggestFollowups', true)) {
+				return [];
+			}
+			return suggestFollowups(result && result.metadata);
+		}
+	};
+	// Name new chat sessions with opencode's own auto-generated session title.
+	participant.titleProvider = {
+		provideChatTitle: (context, token) => provideChatTitle(context, token)
+	};
 	ctx.subscriptions.push(participant);
 
 	// System prompt as an editable markdown doc (saves write the setting).
@@ -912,6 +1413,20 @@ function activate(ctx) {
 
 	// Sparkle action in the SCM input box (replaces Copilot's, via OpenRouter).
 	registerCommitMessageGenerator(ctx, output);
+
+	// "Add Terminal Selection to opencode Chat" — terminal context menu + palette.
+	try {
+		registerTerminalContext(ctx, output);
+	} catch (err) {
+		output.appendLine(`Failed to register terminal context command: ${err && err.message}`);
+	}
+
+	// Ghost-text inline completions (replaces Copilot's, via a local FIM server).
+	try {
+		registerInlineCompletions(ctx, output);
+	} catch (err) {
+		output.appendLine(`Failed to register inline completions: ${err && err.message}`);
+	}
 
 	// Register opencode's models as a language model provider so the chat
 	// framework can resolve request.model (and populate the model picker).
