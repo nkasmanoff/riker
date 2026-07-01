@@ -102,6 +102,11 @@
           "default": "ask",
           "description": "Whether opencode must ask for approval before running shell (bash) commands. Commands are blocked until you respond; \"Allow for Session\" stops prompting until the window is reloaded. Applies to new chat sessions."
         },
+        "opencode.approval.notifyWhenUnfocused": {
+          "type": "boolean",
+          "default": true,
+          "description": "When an edit or command needs approval and the window is not focused, also fire an OS notification so you notice the blocked turn while working in another app. The in-window prompt is still where you approve or deny. Uses the system notifier (osascript on macOS, notify-send on Linux); no effect on Windows or when the window is focused."
+        },
         "opencode.sessionTitle": {
           "type": "string",
           "enum": [

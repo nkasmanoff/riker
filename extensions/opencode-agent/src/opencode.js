@@ -99,9 +99,11 @@ class OpencodeDriver {
 		this.seenToolStart = new Set();
 		this.seenToolResult = new Set();
 		this.seenCostParts = new Set();
+		this.costByMessage = new Map(); // assistant messageID -> its cumulative cost
 		this.gateDiffs = new Map(); // callID -> { filepath, diff } from permission.asked
 		this.pendingQuestionIds = new Set(); // question.asked awaiting our reply
-		this.turnCost = 0;
+		this.pendingPermissionIds = new Set(); // permission.asked awaiting our reply
+		this.turnCost = 0; // fallback: summed step-finish part costs (see totalCost)
 		this.lastTokens = null; // latest assistant message tokens (context usage)
 		this.interrupted = false;
 
@@ -218,9 +220,16 @@ class OpencodeDriver {
 			// The POST resolves when the reply finishes generating, but trailing
 			// events (final part updates, session.idle) can arrive just after.
 			// session.idle is authoritative; the timer is a safety net.
+			// Pass the turn's abort signal so an interrupt tears the request down
+			// promptly. Without it the POST stays open until the server responds —
+			// and when a tool is blocked on a permission prompt, the server is
+			// itself waiting on us, so the turn could hang indefinitely (or for the
+			// 10s safety net) and the handler couldn't return its session id for
+			// the next turn to resume — making the chat "forget" the conversation.
 			const post = api(baseUrl, 'POST', `/session/${this.sessionId}/message`, {
 				directory: this.projectDir,
-				body
+				body,
+				signal: ac.signal
 			});
 
 			let idleTimeout;
@@ -233,13 +242,13 @@ class OpencodeDriver {
 			]);
 			await post.catch(() => { /* error already surfaced via session.error/abort */ });
 
-			this.emit({ kind: 'turn-complete', costUsd: this.turnCost, tokens: this.lastTokens });
+			this.emit({ kind: 'turn-complete', costUsd: this.totalCost(), tokens: this.lastTokens });
 			return { code: this.interrupted ? null : 0 };
 		} catch (err) {
 			if (!this.interrupted) {
 				this.emit({ kind: 'error', message: String(err && err.message || err) });
 			}
-			this.emit({ kind: 'turn-complete', costUsd: this.turnCost, tokens: this.lastTokens });
+			this.emit({ kind: 'turn-complete', costUsd: this.totalCost(), tokens: this.lastTokens });
 			return { code: this.interrupted ? null : 1 };
 		} finally {
 			ac.abort();
@@ -252,15 +261,26 @@ class OpencodeDriver {
 	interrupt() {
 		this.interrupted = true;
 		const sessionId = this.sessionId;
-		// Unblock any question tool still waiting on us before aborting the
-		// session, so the server doesn't keep the request pending forever.
+		// Unblock any question OR permission tool still waiting on us before
+		// aborting the session, so the server doesn't keep the request — and the
+		// session — pending forever (which also leaves the conversation unable to
+		// resume cleanly on the next turn). Clearing the id sets first means the
+		// pending UI callbacks, when they finally resolve, skip their now-stale
+		// replies (see the `pendingPermissionIds.delete` guard).
 		const pendingQuestions = [...this.pendingQuestionIds];
 		this.pendingQuestionIds.clear();
+		const pendingPermissions = [...this.pendingPermissionIds];
+		this.pendingPermissionIds.clear();
 		if (sessionId) {
 			getServerUrl()
 				.then((baseUrl) => Promise.allSettled([
 					...pendingQuestions.map((id) =>
 						api(baseUrl, 'POST', `/question/${id}/reject`, { directory: this.projectDir })),
+					...pendingPermissions.map((id) =>
+						api(baseUrl, 'POST', `/session/${sessionId}/permissions/${id}`, {
+							directory: this.projectDir,
+							body: { response: 'reject' }
+						})),
 					api(baseUrl, 'POST', `/session/${sessionId}/abort`, { directory: this.projectDir })
 				]))
 				.catch(() => { /* best effort */ });
@@ -292,10 +312,28 @@ class OpencodeDriver {
 		this.seenToolStart.clear();
 		this.seenToolResult.clear();
 		this.seenCostParts.clear();
+		this.costByMessage.clear();
 		this.gateDiffs.clear();
 		this.pendingQuestionIds.clear();
+		this.pendingPermissionIds.clear();
 		this.turnCost = 0;
 		this.interrupted = false;
+	}
+
+	/**
+	 * Cumulative cost of the current turn in USD. Prefers the assistant
+	 * messages' own `cost` (authoritative, cumulative per message); falls back to
+	 * summed step-finish part costs for server versions that only report there.
+	 */
+	totalCost() {
+		if (this.costByMessage.size > 0) {
+			let sum = 0;
+			for (const c of this.costByMessage.values()) {
+				sum += c;
+			}
+			return sum;
+		}
+		return this.turnCost;
 	}
 
 	emitSession(isNew = false) {
@@ -324,10 +362,18 @@ class OpencodeDriver {
 				if (info.sessionID === this.sessionId && info.role === 'user' && info.id) {
 					this.userMessageIds.add(info.id);
 				}
-				// The assistant message accumulates token counts as steps finish;
-				// the latest update reflects current context consumption.
-				if (info.sessionID === this.sessionId && info.role === 'assistant' && info.tokens) {
-					this.lastTokens = info.tokens;
+				// The assistant message accumulates token counts AND cost as steps
+				// finish; the latest update reflects current consumption. Cost lives
+				// on the message itself (cumulative across its steps) — the same
+				// place as tokens — not on step-finish parts, which don't reliably
+				// carry it (that path left the status bar stuck at $0.000).
+				if (info.sessionID === this.sessionId && info.role === 'assistant') {
+					if (info.tokens) {
+						this.lastTokens = info.tokens;
+					}
+					if (typeof info.cost === 'number' && info.id) {
+						this.costByMessage.set(info.id, info.cost);
+					}
 				}
 				break;
 			}
@@ -446,22 +492,29 @@ class OpencodeDriver {
 							.then((r) => (r === 'reject' ? 'reject' : (r === 'once' ? 'once' : 'always')))
 							.catch(() => 'always')
 						: Promise.resolve('always');
-				} else {
-					// Other permissions (webfetch, doom_loop, external_directory):
-					// mirror non-interactive `opencode run` — don't stall the turn.
-					this.emit({ kind: 'status', status: `auto-approving permission: ${props.permission ?? ''} ${(props.patterns ?? []).join(', ')}` });
-					decision = Promise.resolve('always');
+			} else {
+				// Other permissions (webfetch, doom_loop, external_directory):
+				// mirror non-interactive `opencode run` — don't stall the turn.
+				this.emit({ kind: 'status', status: `auto-approving permission: ${props.permission ?? ''} ${(props.patterns ?? []).join(', ')}` });
+				decision = Promise.resolve('always');
+			}
+			// Track the request so an interrupt can release the blocked tool
+			// (reject it) instead of leaving it — and the session — hung waiting
+			// on a UI prompt the user can no longer reach.
+			this.pendingPermissionIds.add(props.id);
+			decision.then((response) => {
+				if (!this.pendingPermissionIds.delete(props.id)) {
+					return; // already settled (e.g. rejected on interrupt) — don't double-reply
 				}
-				decision.then((response) =>
-					api(baseUrl, 'POST', `/session/${this.sessionId}/permissions/${props.id}`, {
-						directory: this.projectDir,
-						body: { response }
-					})
-				).catch((err) => {
-					// A lost reply would leave the tool blocked; surface it.
-					this.emit({ kind: 'error', message: `permission reply failed: ${String(err && err.message || err)}` });
+				return api(baseUrl, 'POST', `/session/${this.sessionId}/permissions/${props.id}`, {
+					directory: this.projectDir,
+					body: { response }
 				});
-				break;
+			}).catch((err) => {
+				// A lost reply would leave the tool blocked; surface it.
+				this.emit({ kind: 'error', message: `permission reply failed: ${String(err && err.message || err)}` });
+			});
+			break;
 			}
 			default:
 				break;

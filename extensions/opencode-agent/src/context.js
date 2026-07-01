@@ -43,6 +43,14 @@ const LANG_BY_EXT = {
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico']);
 
+// Image extensions a vision model can actually consume as media. SVG/ICO are
+// markup/container formats most models don't accept, so we inline those as text
+// references instead of shipping raw bytes the model can't read.
+const IMAGE_MIME_BY_EXT = {
+	png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+	gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp'
+};
+
 function extOf(p) {
 	const ext = path.extname(p || '');
 	return ext ? ext.slice(1).toLowerCase() : '';
@@ -54,6 +62,11 @@ function langFor(p) {
 
 function isImagePath(p) {
 	return IMAGE_EXTS.has(extOf(p));
+}
+
+/** The image media mime type for a path the model can consume, else ''. */
+function imageMimeForPath(p) {
+	return IMAGE_MIME_BY_EXT[extOf(p)] ?? '';
 }
 
 /** A reference value that carries image/binary bytes (ChatReferenceBinaryData). */
@@ -141,6 +154,20 @@ async function uriBlock(value, ctx) {
 		return { text, cost: text.length, label: `${rel}/` };
 	}
 	if (isImagePath(fsPath)) {
+		// Ship the actual bytes as a media `file` part so a vision model can see
+		// the image directly (parity with pasted/dragged images). Formats a model
+		// can't read (svg/ico) fall through to a plain reference note.
+		const mime = imageMimeForPath(fsPath);
+		if (mime && typeof ctx.fs.readBytes === 'function') {
+			try {
+				const bytes = await ctx.fs.readBytes(fsPath);
+				const b64 = Buffer.from(bytes).toString('base64');
+				return {
+					filePart: { type: 'file', mime, filename: path.basename(fsPath), url: `data:${mime};base64,${b64}` },
+					label: rel
+				};
+			} catch { /* fall through to the reference note */ }
+		}
 		const text = `Image file attached: ${rel} (open it with your tools to view).`;
 		return { text, cost: text.length, label: rel };
 	}
@@ -264,6 +291,9 @@ function defaultFs() {
 		async readText(p) {
 			return Buffer.from(await vscode.workspace.fs.readFile(uriFor(p))).toString('utf8');
 		},
+		async readBytes(p) {
+			return await vscode.workspace.fs.readFile(uriFor(p));
+		},
 		async list(p) {
 			const entries = await vscode.workspace.fs.readDirectory(uriFor(p));
 			return entries.map(([name, type]) => (type & vscode.FileType.Directory) ? `${name}/` : name);
@@ -315,9 +345,15 @@ async function buildRequestContext(references, opts = {}) {
 			if (isUri(value)) {
 				const block = await uriBlock(value, ctx);
 				if (block) {
-					blocks.push(block.text);
-					used += block.cost;
-					labels.push(block.label);
+					if (block.filePart) {
+						// An image file: ship the bytes as a media part, not text.
+						fileParts.push(block.filePart);
+						labels.push(block.label);
+					} else {
+						blocks.push(block.text);
+						used += block.cost;
+						labels.push(block.label);
+					}
 				}
 				continue;
 			}
@@ -357,6 +393,7 @@ module.exports = {
 	// Exported for unit tests.
 	langFor,
 	isImagePath,
+	imageMimeForPath,
 	isUri,
 	isLocation,
 	isBinaryData,

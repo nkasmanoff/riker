@@ -57,7 +57,16 @@ async function registerLanguageModelProvider(ctx, output) {
 					// "Auto". The actual tool execution still happens inside the
 					// opencode CLI, driven by our chat participant — VS Code's
 					// agent loop does not drive tool calls through this provider.
-					toolCalling: true
+					toolCalling: true,
+					// Allow image attachments in the chat input. The input gates
+					// the image attach/paste/drag affordances on the selected
+					// model's `vision` capability (chatContext.ts), which maps from
+					// this `imageInput` flag (extHostLanguageModels.ts). Without it
+					// the chat silently refuses pasted/dragged images even though
+					// context.js already forwards them to opencode as media parts.
+					// opencode passes media straight to the underlying model, so
+					// vision support is ultimately the picked model's concern.
+					imageInput: true
 				}
 			}));
 		},

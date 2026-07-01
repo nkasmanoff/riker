@@ -5,6 +5,46 @@ and what's left to do. Pick up from here.
 
 ## Done
 
+### Recent (2026-07-01)
+- **Session cost no longer stuck at $0.000** (`src/opencode.js`): the status-bar
+  and `/usage` cost was read from a separate, untested `step-finish` `part.cost`
+  path, which never populated — so spend showed `$0.000` while context % worked
+  (tokens come from the assistant `message.updated` event). Cost lives on the
+  assistant message itself (cumulative per message, sibling to `tokens`), so it's
+  now captured from the same `message.updated` event (`costByMessage` keyed by
+  message id, latest value wins → summed in `totalCost()`). The old step-finish
+  sum is kept only as a fallback for server versions that report cost there.
+  Covered by the extended `test/unit.js` tokens+cost turn-complete test.
+- **Approval prompts survive an unfocused window** (`src/extension.js`): the
+  edit/command approval prompts switched from `showInformationMessage` (a toast
+  that auto-hides and buries the turn in the notification center) to a persistent,
+  `ignoreFocusOut` QuickPick (`requestApproval`) — the turn can no longer get
+  silently stuck on "Waiting for approval…". Additionally, when the window is
+  **not** focused, a best-effort OS notification fires (`notifyIfUnfocused`:
+  `osascript` on macOS, `notify-send` on Linux; setting
+  `opencode.approval.notifyWhenUnfocused`, default on) so a blocked turn is
+  noticed while working in another app. The QuickPick stays the actual
+  approve/deny UI; the banner is only an attention-grabber. (Partially addresses
+  Next Steps §1 — an in-chat confirmation part is still the richer eventual UX.)
+- **Blocked-permission turns can't hang / "forget" the conversation**
+  (`src/opencode.js`): the message POST now carries the turn's abort signal, and
+  `permission.asked` ids are tracked (`pendingPermissionIds`) and replied
+  `reject` on interrupt (mirroring the question path). Previously an interrupt
+  while a tool was blocked on a permission gate left the POST open (server itself
+  waiting on us) until the 10s safety net, and the handler couldn't return its
+  session id — so the next turn couldn't resume and the chat appeared to forget
+  the conversation. Covered in `test/unit.js`.
+- **Attached image *files* shipped as media parts** (`src/context.js`,
+  `src/lmProvider.js`): the context forwarder already sent *pasted/dragged* images
+  as `data:`-URL `file` parts, but an attached image **file** `Uri` was inlined as
+  a "open it with your tools" text note the model couldn't see. Now consumable
+  formats (png/jpg/gif/webp/bmp) are read and shipped as media parts too
+  (`imageMimeForPath`; svg/ico still fall back to a text note). Required flipping
+  the provider's `imageInput: true` capability — the chat input gates the image
+  attach/paste/drag affordances on the picked model's `vision` flag, which maps
+  from this, so without it the chat silently refused images despite `context.js`
+  forwarding them. Covered in `test/unit.js`.
+
 - **Terminal in the loop** (Cursor parity). Two halves:
   - *Agent shell output rendered* (`src/toolOutput.js`): `bash` tool results used
     to collapse to a one-line "done" progress row even though opencode captured
@@ -420,11 +460,15 @@ baseline). Acceptable; true deletion would require deleting the file before the
 externalEdit so the engine records a Create operation.
 
 ### 1. Approval UX upgrades
-The per-edit and per-command approve/deny gates are live (see Done), both via
-notification prompts. Possible refinements:
-- Render the prompt as an in-chat confirmation part instead of a
-  notification (mid-turn `stream.confirmation` replies arrive as a *new*
-  chat request, so this needs a queued-request dance — investigate).
+The per-edit and per-command approve/deny gates are live (see Done), now via a
+persistent QuickPick (was a toast) plus an OS notification when the window is
+unfocused. Possible refinements:
+- Render the prompt as an in-chat confirmation part instead of a QuickPick
+  (mid-turn `stream.confirmation` replies arrive as a *new* chat request, so
+  this needs a queued-request dance — investigate). This is the richer eventual
+  UX the QuickPick is a stopgap for.
+- Extend the unfocused OS notification to `question.asked` prompts too (it
+  currently only covers the edit/command approval QuickPick).
 - Extend asking to `webfetch` (currently auto-"always") behind a setting.
 - Auto-approve an allowlist of obviously-safe read-only commands
   (`ls`, `cat`, `git status`, …) so command `ask` mode is less noisy.
@@ -439,8 +483,8 @@ notification prompts. Possible refinements:
 Full sweep of `product.defaultChatAgent` consumers + `Setup.completed.negate()`
 nudges. Fixed: SCM input sparkle, merge-conflict "Resolve Conflicts with AI"
 (both disabled via `ContextKeyExpr.false()`, see core patches); editor
-Explain/Fix/Code Review (rerouted to opencode inline chat, see Done). Remaining,
-in rough priority order:
+Explain/Fix/Code Review (rerouted to the opencode chat panel, see Done —
+inline chat was tried and reverted). Remaining, in rough priority order:
 - **Inline editor chat (Cmd+I)** — tried (`"editor"` location + selection
   context) but **reverted**: the inline-chat zone doesn't render opencode's
   streamed markdown/edits (it speaks the inline textEdit protocol + blocks on its
@@ -489,7 +533,14 @@ in rough priority order:
   triggers spurious GitHub auth prompts. Leave it as-is.
 - The extension is **plain CommonJS** (no build step) — edit `src/*.js` and just
   restart the window; no recompile needed. Engine (`src/vs/**`) changes DO need
-  `npm run compile`.
+  `npm run compile` (always with `NODE_OPTIONS=--max-old-space-size=8192`, Node
+  24, or tsc OOMs — the "Requires `npm run compile`" notes above all imply this).
+  Note: the repo's `.claude/CLAUDE.md` (inherited from upstream VS Code) says
+  *never* use `npm run compile` and to prefer the watch task /
+  `compile-check-ts-native` / gulp — that guidance is upstream's; for this fork's
+  one-shot engine-patch rebuilds `npm run compile` is what we use. If an agent is
+  following CLAUDE.md strictly, `compile-check-ts-native` still type-checks
+  `src/` changes without a full build.
 - **Node 24** is required to launch (`.nvmrc` pins 24.15.0); the `oc` launcher
   switches to it via nvm. Global default stays Node 22.
 - Launch with `oc [path]` (alias in `~/.zshrc` → `../../oc`). Dev build, isolated
@@ -506,15 +557,21 @@ in rough priority order:
   ```
   git fetch upstream
   git checkout main && git merge --ff-only upstream/main
-  git checkout opencode && git merge main   # resolve conflicts in our 4 core files
+  git checkout opencode && git merge main   # resolve conflicts in our core files (15, listed below)
   npm i && npm run compile                  # engine changed → recompile
   ```
   Our core-patch surface is intentionally tiny (15 files: `product.json`,
-  `extHostLanguageModels.ts`, `chatStatusEntry.ts`, `chatTipCatalog.ts`,
+  `extHostLanguageModels.ts`, `chatStatusEntry.ts` — the Copilot "Sign In"
+  status-bar entry is rebranded to an "opencode" entry (`$(hubot) opencode`)
+  that opens the chat view via `CHAT_OPEN_ACTION_ID` instead of firing the
+  defunct Copilot setup flow (the sign-in/entitlement affordance logic is
+  dropped), `chatTipCatalog.ts` — the Plan-mode tip's dead
+  `workbench.action.chat.openPlan` link (unregistered with Copilot gone) is
+  rewired to open the chat view prefilled with `/plan `,
   `scmInput.ts` — Copilot setup sparkle disabled in the SCM input menu,
   `scm.contribution.ts` — same for "Resolve Conflicts with AI", `chatSetup/
   chatSetupProviders.ts` + `chatSetup/chatSetupContributions.ts` — editor
-  Explain/Fix/Code Review rerouted to opencode inline chat, `chat/common/
+  Explain/Fix/Code Review rerouted to the opencode chat panel, `chat/common/
   constants.ts` + `agentSessions/agentSessionsBanner.ts` — the Copilot "Agents
   window" entry points and promo banner disabled, `chat/browser/actions/
   chatActions.ts` — the `attachText` chat-open option for terminal-selection

@@ -603,21 +603,28 @@ testAsync('send: no system field when no prompt configured', async () => {
 	assert.strictEqual('system' in post.opts.body, false);
 });
 
-testAsync('send: assistant tokens surface on turn-complete', async () => {
+testAsync('send: assistant tokens and cost surface on turn-complete', async () => {
 	apiCalls.length = 0;
 	const { driver, events } = makeDriver(undefined);
 	const turn = driver.send('hello');
 	await settle();
 	const tokens = { input: 1000, output: 200, reasoning: 50, cache: { read: 5000, write: 100 } };
+	// Cost lives on the assistant message (cumulative across its steps), the same
+	// place as tokens. Emit two updates for the same message to prove the latest
+	// (cumulative) value wins rather than double-counting.
 	lastEventSink({
 		type: 'message.updated',
-		properties: { info: { sessionID: 'ses_test', role: 'assistant', id: 'msg_a', tokens } }
+		properties: { info: { sessionID: 'ses_test', role: 'assistant', id: 'msg_a', tokens, cost: 0.001 } }
+	});
+	lastEventSink({
+		type: 'message.updated',
+		properties: { info: { sessionID: 'ses_test', role: 'assistant', id: 'msg_a', tokens, cost: 0.0034 } }
 	});
 	lastEventSink({ type: 'session.idle', properties: { sessionID: 'ses_test' } });
 	await turn;
 	const complete = events.find((e) => e.kind === 'turn-complete');
 	assert.ok(complete, 'turn-complete not emitted');
-	assert.deepStrictEqual(complete.tokens, tokens);
+	assert.deepStrictEqual({ tokens: complete.tokens, costUsd: complete.costUsd }, { tokens, costUsd: 0.0034 });
 });
 
 // ── context (attached references) ─────────────────────────────────────────
@@ -638,13 +645,13 @@ test('context: langFor maps extensions, relPath strips project dir', () => {
 	assert.strictEqual(relPath('/other/a.ts', '/proj'), '/other/a.ts');
 });
 
-function fakeFs(files = {}, dirs = {}) {
+function fakeFs(files = {}, dirs = {}, bytes = {}) {
 	return {
 		async stat(p) {
 			if (dirs[p]) {
 				return 'directory';
 			}
-			if (p in files) {
+			if (p in files || p in bytes) {
 				return 'file';
 			}
 			return 'unknown';
@@ -654,6 +661,12 @@ function fakeFs(files = {}, dirs = {}) {
 				throw new Error('ENOENT');
 			}
 			return files[p];
+		},
+		async readBytes(p) {
+			if (!(p in bytes)) {
+				throw new Error('ENOENT');
+			}
+			return bytes[p];
 		},
 		async list(p) { return dirs[p] || []; }
 	};
@@ -713,6 +726,19 @@ testAsync('context: an image becomes a data-url file part, not text', async () =
 	assert.strictEqual(fileParts[0].type, 'file');
 	assert.strictEqual(fileParts[0].mime, 'image/png');
 	assert.ok(fileParts[0].url.startsWith('data:image/png;base64,'), fileParts[0].url);
+	assert.strictEqual(fileParts[0].url, 'data:image/png;base64,' + Buffer.from(bytes).toString('base64'));
+});
+
+testAsync('context: an attached image file is forwarded as a media part', async () => {
+	const bytes = new Uint8Array([137, 80, 78, 71]); // PNG magic-ish
+	const fs = fakeFs({}, {}, { '/proj/shot.png': bytes });
+	const refs = [{ id: 'img', value: { scheme: 'file', path: '/proj/shot.png', fsPath: '/proj/shot.png' } }];
+	const { contextText, fileParts } = await buildRequestContext(refs, { projectDir: '/proj', fs });
+	assert.strictEqual(contextText, ''); // not inlined as a text note anymore
+	assert.strictEqual(fileParts.length, 1);
+	assert.strictEqual(fileParts[0].type, 'file');
+	assert.strictEqual(fileParts[0].mime, 'image/png');
+	assert.strictEqual(fileParts[0].filename, 'shot.png');
 	assert.strictEqual(fileParts[0].url, 'data:image/png;base64,' + Buffer.from(bytes).toString('base64'));
 });
 
@@ -1070,6 +1096,29 @@ testAsync('permission.asked bash: callback throw falls back to always (turn neve
 	await settle();
 	const post = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
 	assert.strictEqual(post.opts.body.response, 'always');
+});
+
+testAsync('interrupt rejects a pending bash permission and skips the late reply', async () => {
+	apiCalls.length = 0;
+	let resolveDecision;
+	// The approval UI is still open (promise pending) when the user interrupts.
+	const { driver } = makeCommandDriver(() => new Promise((resolve) => { resolveDecision = resolve; }));
+	driver.handleServerEvent(BASH_PERMISSION_EVENT, 'http://mock', () => { });
+	await settle();
+	assert.strictEqual(apiCalls.length, 0); // still waiting on the user
+
+	driver.interrupt();
+	await settle();
+	const reject = apiCalls.find((c) => c.path === '/session/ses_test/permissions/perm_1');
+	assert.ok(reject, 'pending permission was not rejected on interrupt');
+	assert.strictEqual(reject.opts.body.response, 'reject');
+	assert.ok(apiCalls.some((c) => c.path === '/session/ses_test/abort'), 'session not aborted');
+
+	// The user's late choice must not produce a second (stale) reply.
+	apiCalls.length = 0;
+	resolveDecision('once');
+	await settle();
+	assert.ok(!apiCalls.some((c) => c.path === '/session/ses_test/permissions/perm_1'), 'stale reply was sent');
 });
 
 (async () => {
