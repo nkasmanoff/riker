@@ -9,6 +9,7 @@
 const vscode = require('vscode');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
 const { OpencodeDriver } = require('./opencode');
 const { getOpencodeDescriptor } = require('./descriptor');
 const { registerLanguageModelProvider } = require('./lmProvider');
@@ -431,12 +432,11 @@ async function approveEditRequest(req, stream, captured) {
 	}
 
 	stream.progress(`Waiting for approval to edit ${fileLabel}…`);
-	const choice = await vscode.window.showInformationMessage(
-		`opencode wants to edit ${fileLabel}`,
-		'Allow',
-		'Allow for Session',
-		'Deny'
-	);
+	const choice = await requestApproval({
+		title: `opencode wants to edit ${fileLabel}`,
+		placeHolder: 'Approve this file edit (edits are blocked until you choose)',
+		sessionDescription: 'Stop asking about edits for the rest of this window'
+	});
 	if (choice === 'Allow for Session') {
 		sessionAutoApproveEdits = true;
 		return 'once';
@@ -447,6 +447,73 @@ async function approveEditRequest(req, stream, captured) {
 	// Explicit deny, or the prompt was dismissed: never apply silently.
 	stream.warning(`Edit to ${fileLabel} denied${choice ? '' : ' (approval prompt dismissed)'}.`);
 	return 'reject';
+}
+
+const APPROVAL_ALLOW = 'Allow';
+const APPROVAL_ALLOW_SESSION = 'Allow for Session';
+const APPROVAL_DENY = 'Deny';
+
+/**
+ * Fire a best-effort OS notification when the window is NOT focused, so a
+ * blocked approval prompt is noticed even while the user is in another app. The
+ * in-window QuickPick remains the actual approval UI — this only grabs attention
+ * (native banners aren't reliably actionable). No-op when the window is focused,
+ * when disabled via `opencode.approval.notifyWhenUnfocused`, or on unsupported
+ * platforms; every failure is swallowed (a missing `osascript`/`notify-send`
+ * must never break the approval flow).
+ *
+ * @param {string} body one-line description of what needs approval
+ */
+function notifyIfUnfocused(body) {
+	if (vscode.window.state.focused) {
+		return;
+	}
+	if (!vscode.workspace.getConfiguration('opencode').get('approval.notifyWhenUnfocused', true)) {
+		return;
+	}
+	// AppleScript/shell string literals can't span newlines; collapse + cap.
+	const text = String(body).replace(/\s+/g, ' ').trim().slice(0, 200);
+	try {
+		if (process.platform === 'darwin') {
+			const esc = (s) => s.replace(/[\\"]/g, '\\$&');
+			execFile('osascript', ['-e',
+				`display notification "${esc(text)}" with title "opencode approval needed" sound name "Ping"`]);
+		} else if (process.platform === 'linux') {
+			execFile('notify-send', ['opencode approval needed', text]);
+		}
+	} catch { /* best-effort: a notifier that isn't installed must not block approval */ }
+}
+
+/**
+ * Prompt the user to approve/deny a blocked action with a prompt that CANNOT be
+ * silently lost.
+ *
+ * The previous implementation used `showInformationMessage`, whose toast
+ * auto-hides after a few seconds and collapses into the (easily missed)
+ * notification center — leaving the turn stuck on "Waiting for approval…" with
+ * no visible way to respond. A QuickPick stays open and centered until the user
+ * chooses (and `ignoreFocusOut` keeps it from vanishing on a click elsewhere),
+ * matching the question-approval UX. Esc / dismissal returns `undefined`, which
+ * callers treat as a deny.
+ *
+ * @param {{ title: string, placeHolder?: string, sessionDescription?: string }} opts
+ * @returns {Promise<'Allow' | 'Allow for Session' | 'Deny' | undefined>}
+ */
+async function requestApproval(opts) {
+	// If the user is looking elsewhere, surface an OS banner so the blocked turn
+	// isn't silently waiting behind an unfocused window.
+	notifyIfUnfocused(opts.title);
+	const items = [
+		{ label: APPROVAL_ALLOW, description: 'Once' },
+		{ label: APPROVAL_ALLOW_SESSION, description: opts.sessionDescription || 'Stop asking for the rest of this window' },
+		{ label: APPROVAL_DENY, description: 'Reject' }
+	];
+	const picked = await vscode.window.showQuickPick(items, {
+		title: opts.title,
+		placeHolder: opts.placeHolder || opts.title,
+		ignoreFocusOut: true
+	});
+	return picked ? picked.label : undefined;
 }
 
 /**
@@ -474,13 +541,11 @@ async function approveCommandRequest(req, stream) {
 
 	const label = command.length > 60 ? command.slice(0, 60) + '…' : command;
 	stream.progress('Waiting for approval to run a command…');
-	const choice = await vscode.window.showInformationMessage(
-		`opencode wants to run: ${label || 'a shell command'}`,
-		{ modal: false },
-		'Allow',
-		'Allow for Session',
-		'Deny'
-	);
+	const choice = await requestApproval({
+		title: `opencode wants to run: ${label || 'a shell command'}`,
+		placeHolder: 'Approve this shell command (it is blocked until you choose)',
+		sessionDescription: 'Run commands without asking for the rest of this window'
+	});
 	if (choice === 'Allow for Session') {
 		sessionAutoApproveCommands = true;
 		return 'always';

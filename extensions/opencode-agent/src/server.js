@@ -170,8 +170,9 @@ function disposeServer() {
 /**
  * Call the opencode REST API. All session routes are scoped by the
  * `directory` query param (opencode keeps one instance per project dir).
+ * An optional `signal` aborts the in-flight request (e.g. on turn interrupt).
  */
-async function api(baseUrl, method, path, { directory, body } = {}) {
+async function api(baseUrl, method, path, { directory, body, signal } = {}) {
 	const url = new URL(baseUrl + path);
 	if (directory) {
 		url.searchParams.set('directory', directory);
@@ -179,7 +180,8 @@ async function api(baseUrl, method, path, { directory, body } = {}) {
 	const res = await httpRequest(url, {
 		method,
 		headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
-		body: body !== undefined ? JSON.stringify(body) : undefined
+		body: body !== undefined ? JSON.stringify(body) : undefined,
+		signal
 	});
 	const text = await readBody(res);
 	const status = res.statusCode ?? 0;
